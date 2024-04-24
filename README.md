@@ -59,6 +59,7 @@ docker compose up
 
 ### One-click cloud templates
 <img width="200px" src="https://www.deploytodo.com/do-btn-blue-ghost.svg" alt="Deploy to DO" width="150px">
+Pending approval by DigitalOcean
 
 ## Gallery
 
