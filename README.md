@@ -1,13 +1,13 @@
 
 <p align="center">
-  <img width="245px" src="https://github.com/goksan/statusnook/assets/17437810/3823552e-22bf-4bee-82dc-79648135fff6">
+  <img width="245px" src="https://github.com/goksan/statusnook/assets/17437810/0b8bea4c-16cc-4d57-a984-49f01aca85d7">
 </p>
 
 <p align="center">
 Effortlessly deploy a status page and start monitoring endpoints in minutes
 </p>
 
-![status-page](https://github.com/goksan/statusnook/assets/17437810/0e650d0d-451a-49e3-b7b9-01022c1f931f)
+![status page](https://github.com/goksan/statusnook/assets/17437810/ff2bb1d4-5d75-4b6e-b8d9-a7227d1aee6c)
 
 <br>
 
@@ -62,9 +62,9 @@ docker compose up
 
 ## Gallery
 
-![monitors](https://github.com/goksan/statusnook/assets/17437810/57424a49-9eec-480a-9450-62af078846f1)
-![monitor-logs](https://github.com/goksan/statusnook/assets/17437810/16c0ecc0-311c-436e-8d01-04159d1a4f1c)
-![notifications](https://github.com/goksan/statusnook/assets/17437810/80564b2c-fb2d-47e5-9b74-781b7e9a264c)
+![monitors](https://github.com/goksan/statusnook/assets/17437810/9bc9a023-41fc-4646-a353-0a1755ce148b)
+![monitor logs](https://github.com/goksan/statusnook/assets/17437810/23d988b1-a9fe-41a4-9fa3-f524c4612958)
+![notifications](https://github.com/goksan/statusnook/assets/17437810/ff35893c-d4eb-4bb5-af1b-9f07e716265a)
 
 
 
