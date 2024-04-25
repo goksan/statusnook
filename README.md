@@ -1,9 +1,9 @@
-
 <p align="center">
   <a href="https://statusnook.com" target="_blank">
-    <img width="245px" src="https://github.com/goksan/statusnook/assets/17437810/0b8bea4c-16cc-4d57-a984-49f01aca85d7">
+    <img width="245px" src="https://github.com/goksan/Statusnook/assets/17437810/3ad70900-ed19-4d24-8ac3-a4e909901975">
   </a>
 </p>
+
 
 <p align="center">
 Effortlessly deploy a status page and start monitoring endpoints in minutes
