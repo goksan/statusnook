@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -707,6 +708,53 @@ func listAllMonitorLogLastChecked(tx *sql.Tx) ([]monitorLogLastChecked, error) {
 	return allLastChecked, nil
 }
 
+type plainOrLoginAuth struct {
+	username string
+	password string
+	host     string
+	auth     string
+}
+
+func PlainOrLoginAuth(username string, password string, host string) smtp.Auth {
+	return &plainOrLoginAuth{username: username, password: password, host: host}
+}
+
+func (a *plainOrLoginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS {
+		return "", nil, fmt.Errorf("plainAuth.Start: unencrypted connection")
+	}
+
+	if slices.Contains(server.Auth, "PLAIN") {
+		a.auth = "PLAIN"
+		return smtp.PlainAuth("", a.username, a.password, a.host).Start(server)
+	}
+
+	if slices.Contains(server.Auth, "LOGIN") {
+		a.auth = "LOGIN"
+		return "LOGIN", []byte(a.username), nil
+	}
+
+	return "", nil, fmt.Errorf("plainAuth.Start: unhandled auth")
+}
+
+func (a *plainOrLoginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if a.auth == "PLAIN" {
+		return smtp.PlainAuth("", a.username, a.password, a.host).Next(fromServer, more)
+	}
+
+	if a.auth == "LOGIN" && more {
+		switch string(fromServer) {
+		case "Username:":
+			return []byte(a.username), nil
+		case "Password:":
+			return []byte(a.password), nil
+		default:
+			return nil, fmt.Errorf("plainAuth.Next: unexpected from server")
+		}
+	}
+	return nil, nil
+}
+
 func sendMonitorAlertEmail(
 	monitor Monitor,
 	channel NotificationChannel,
@@ -724,8 +772,7 @@ func sendMonitorAlertEmail(
 		)
 	}
 
-	smtpAuth := smtp.PlainAuth(
-		"",
+	smtpAuth := PlainOrLoginAuth(
 		smtpDetail.Username,
 		smtpDetail.Password,
 		smtpDetail.Host,
@@ -1555,8 +1602,7 @@ func notificationLoop(ctx context.Context, wg *sync.WaitGroup) {
 
 							err = smtp.SendMail(
 								smtpDetail.Host+":"+strconv.Itoa(smtpDetail.Port),
-								smtp.PlainAuth(
-									"",
+								PlainOrLoginAuth(
 									smtpDetail.Username,
 									smtpDetail.Password,
 									smtpDetail.Host,
@@ -2982,8 +3028,7 @@ If this email reached you by mistake, feel free to ignore it and we won't subscr
 
 	err = smtp.SendMail(
 		smtpDetail.Host+":"+strconv.Itoa(smtpDetail.Port),
-		smtp.PlainAuth(
-			"",
+		PlainOrLoginAuth(
 			smtpDetail.Username,
 			smtpDetail.Password,
 			smtpDetail.Host,
