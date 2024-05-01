@@ -67,6 +67,8 @@ amd64 and arm64 Linux binaries can be found on the [Releases](https://github.com
 <img width="200px" src="https://www.deploytodo.com/do-btn-blue-ghost.svg" alt="Deploy to DO" width="150px">
 Pending approval by DigitalOcean
 
+[![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/STATOK)
+
 ## Gallery
 
 ![monitors](https://github.com/goksan/statusnook/assets/17437810/9bc9a023-41fc-4646-a353-0a1755ce148b)
