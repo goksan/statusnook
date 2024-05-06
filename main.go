@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -22,6 +23,7 @@ import (
 	"html"
 	"html/template"
 	"io"
+	"io/fs"
 	"log"
 	"math/big"
 	mathRand "math/rand"
@@ -32,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"runtime"
 	"slices"
 	"strconv"
@@ -44,7 +47,7 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"github.com/mholt/acmez/acme"
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/bcrypt"
@@ -65,7 +68,7 @@ func initDB(immediate bool) *sql.DB {
 	if _, err := os.Stat("statusnook-data"); errors.Is(err, os.ErrNotExist) {
 		err := os.Mkdir("statusnook-data", os.ModePerm)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("initDB.Mkdir: %s", err)
 		}
 	}
 
@@ -75,47 +78,143 @@ func initDB(immediate bool) *sql.DB {
 	}
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("initDB.Open: %s", err)
 	}
 
-	const tableCountQuery = `
-		select
-			count(*)
-		from
-			sqlite_schema
-		where 
-			type = 'table' and 
-			name not like 'sqlite_%';
-	`
-
-	tableCount := 0
-	row := db.QueryRow(tableCountQuery)
-	err = row.Scan(&tableCount)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if tableCount == 0 {
-		_, err = db.Exec(sqlSchema)
+	if immediate {
+		files, err := migrationsFS.ReadDir("migrations")
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("initDB.ReadDir: %s", err)
 		}
-		return db
-	}
 
-	const userCountQuery = `
-		select count(*) from user
-	`
+		slices.SortFunc(files, func(a, b fs.DirEntry) int {
+			return cmp.Compare(a.Name(), b.Name())
+		})
 
-	userCount := 0
-	row = db.QueryRow(userCountQuery)
-	err = row.Scan(&userCount)
-	if err != nil {
-		log.Fatal(err)
-	}
+		const tableCountQuery = `
+			select
+				count(*)
+			from
+				sqlite_schema
+			where 
+				type = 'table' and 
+				name not like 'sqlite_%';
+		`
 
-	if userCount == 0 {
-		return db
+		tableCount := 0
+		row := db.QueryRow(tableCountQuery)
+		err = row.Scan(&tableCount)
+		if err != nil {
+			log.Fatalf("initDB.ScanTableCount: %s", err)
+		}
+
+		if tableCount == 0 {
+			tx, err := db.Begin()
+			if err != nil {
+				log.Fatalf("initDB.BeginExecSchema: %s", err)
+			}
+			defer tx.Rollback()
+
+			_, err = tx.Exec(sqlSchema)
+			if err != nil {
+				log.Fatalf("initDB.ExecSchema: %s", err)
+			}
+
+			params := []any{}
+			placeholders := ""
+			for i, v := range files {
+				placeholders += "(?, ?)"
+				if i < len(files)-1 {
+					placeholders += ", "
+				}
+				params = append(params, strings.TrimRight(v.Name(), ".sql"), true)
+			}
+
+			insertMigrationQuery := fmt.Sprintf(
+				`insert into migration(name, skipped) values %s;`,
+				placeholders,
+			)
+
+			_, err = tx.Exec(insertMigrationQuery, params...)
+			if err != nil {
+				log.Fatalf("initDB.ExecInsertMigration: %s", err)
+			}
+
+			err = tx.Commit()
+			if err != nil {
+				log.Fatalf("initDB.CommitExecSchema: %s", err)
+			}
+		} else {
+			const createMigrationTableQuery = `
+				create table if not exists migration(
+					id integer primary key,
+					name text not null unique,
+					skipped int not null
+				);
+			`
+
+			_, err := db.Exec(createMigrationTableQuery)
+			if err != nil {
+				log.Fatalf("initDB.ExecCreateMigrationTable: %s", err)
+			}
+
+			existingMigrations := map[string]bool{}
+
+			rows, err := db.Query("select name from migration")
+			if err != nil {
+				log.Fatalf("initDB.ExecQueryMigrations: %s", err)
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var name string
+				err = rows.Scan(&name)
+				if err != nil {
+					log.Fatalf("initDB.ScanMigration: %s", err)
+				}
+
+				existingMigrations[name] = true
+			}
+
+			for _, file := range files {
+				migrationName := strings.TrimRight(file.Name(), ".sql")
+				if _, ok := existingMigrations[migrationName]; ok {
+					continue
+				}
+
+				data, err := migrationsFS.ReadFile(path.Join("migrations", file.Name()))
+				if err != nil {
+					log.Fatalf("initDB.ReadFile %s: %s", file.Name(), err)
+				}
+
+				func() {
+					tx, err := db.Begin()
+					if err != nil {
+						log.Fatalf("initDB.BeginMigration %s: %s", file.Name(), err)
+					}
+					defer tx.Rollback()
+
+					_, err = tx.Exec(string(data))
+					if err != nil {
+						log.Fatalf("initDB.ExecMigration %s: %s", file.Name(), err)
+					}
+
+					insertMigrationQuery := fmt.Sprintf(
+						`insert into migration(name, skipped) values ('%s', false)`,
+						migrationName,
+					)
+					_, err = tx.Exec(insertMigrationQuery)
+					if err != nil {
+						log.Fatalf("initDB.ExecInsertMigrationSkip %s: %s", file.Name(), err)
+					}
+
+					err = tx.Commit()
+					if err != nil {
+						log.Fatalf("initDB.CommitMigration %s: %s", file.Name(), err)
+					}
+				}()
+			}
+		}
 	}
 
 	return db
@@ -259,7 +358,7 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 											</dialog>
 										</div>
 										{{if and .Ctx.Index .Ctx.Auth.ID}}
-											<a class="icon-button" href="/admin" hx-boost="true">
+											<a class="icon-button" href="/admin/alerts" hx-boost="true">
 												<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
 													<path fill-rule="evenodd" d="M2.5 3A1.5 1.5 0 001 4.5v4A1.5 1.5 0 002.5 10h6A1.5 1.5 0 0010 8.5v-4A1.5 1.5 0 008.5 3h-6zm11 2A1.5 1.5 0 0012 6.5v7a1.5 1.5 0 001.5 1.5h4a1.5 1.5 0 001.5-1.5v-7A1.5 1.5 0 0017.5 5h-4zm-10 7A1.5 1.5 0 002 13.5v2A1.5 1.5 0 003.5 17h6a1.5 1.5 0 001.5-1.5v-2A1.5 1.5 0 009.5 12h-6z" clip-rule="evenodd" />
 												</svg>
@@ -446,6 +545,9 @@ func parseTextTmpl(name string, markup string) (*textTemplate.Template, error) {
 
 //go:embed static/*
 var staticFS embed.FS
+
+//go:embed migrations/*
+var migrationsFS embed.FS
 
 var appWg sync.WaitGroup
 var db *sql.DB
@@ -2092,6 +2194,8 @@ func main() {
 		r.Get("/unsubscribe", getUnsubscribe)
 		r.Post("/unsubscribe", postUnsubscribe)
 		r.Post("/resubscribe", postResubscribe)
+		r.Get("/invitation/{token}", getInvitation)
+		r.Post("/invitation/{token}", postInvitation)
 	})
 	r.Route("/admin", func(r chi.Router) {
 		r.Use(csrfMiddleware)
@@ -2174,6 +2278,11 @@ func main() {
 			r.Get("/", getSettings)
 			r.Post("/", postSettings)
 			r.Post("/cancel-domain", postSettingsCancelDomain)
+			r.Get("/users/{id}/edit", getEditUser)
+			r.Post("/users/{id}/edit", postEditUser)
+			r.Delete("/users/{id}", deleteUser)
+			r.Post("/users/invite", postInviteUser)
+			r.Delete("/users/invite/{id}", postDeleteInvite)
 		})
 	})
 	r.Route("/login", func(r chi.Router) {
@@ -3441,6 +3550,232 @@ func postResubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func getInvitation(w http.ResponseWriter, r *http.Request) {
+	inviteToken := chi.URLParam(r, "token")
+	if inviteToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("getInvitation.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = validateUserInvitationToken(tx, inviteToken, time.Now().UTC().Add(-time.Hour*24))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		log.Printf("getInvitation.validateUserInvitationToken: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("getInvitation.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	const markup = `
+		{{define "title"}}You're invited to create an admin user{{end}}
+		{{define "body"}}
+			<div class="auth-dialog-container">
+				<div class="auth-dialog">
+					<div>
+						<div>
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+								<path d="M10 8a3 3 0 100-6 3 3 0 000 6zM3.465 14.493a1.23 1.23 0 00.41 1.412A9.957 9.957 0 0010 18c2.31 0 4.438-.784 6.131-2.1.43-.333.604-.903.408-1.41a7.002 7.002 0 00-13.074.003z" />
+					  		</svg>			
+						</div>
+						<h1>You're invited to create an admin user</h1>
+					</div>
+					<form hx-post hx-swap="none">
+						<div id="alert" class="alert"></div>
+						<label>
+							Username
+							<input name="username" required>
+						</label>
+
+						<label>
+							Password
+							<input name="password" type="password" required>
+						</label>
+					
+						<label>
+							Confirm password
+							<input name="password-confirmation" type="password" required>
+						</label>
+
+						<button>Confirm</button>
+					</form>
+				</div>
+			</div>
+		{{end}}
+	`
+
+	tmpl, err := parseTmpl("getInvitation", markup)
+	if err != nil {
+		log.Printf("getInvitation.parseTmpl: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tmpl.Execute(w, nil)
+	if err != nil {
+		log.Printf("getInvitation.Execute: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func postInvitation(w http.ResponseWriter, r *http.Request) {
+	inviteToken := chi.URLParam(r, "token")
+	if inviteToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postInvitation.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	id, err := validateUserInvitationToken(tx, inviteToken, time.Now().UTC().Add(-time.Hour*24))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		log.Printf("postInvitation.validateUserInvitationToken: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = deleteUserInvitation(tx, id)
+	if err != nil {
+		log.Printf("postInvitation.deleteUserInvitation: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	username := r.PostFormValue("username")
+	if username == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="alert" class="alert" hx-swap-oob="true">
+				Username is required
+			</div>
+		`))
+		return
+	}
+
+	password := r.PostFormValue("password")
+	passwordConfirmation := r.PostFormValue("password-confirmation")
+
+	if password != passwordConfirmation {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="alert" class="alert" hx-swap-oob="true">
+				Passwords do not match
+			</div>
+		`))
+		return
+	}
+
+	if len(password) < 8 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="alert" class="alert" hx-swap-oob="true">
+				Password must contain at least 8 characters
+			</div>
+		`))
+		return
+	}
+
+	pwHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("postInvitation.GenerateFromPassword: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	userID, err := createUser(tx, username, string(pwHash))
+	if err != nil {
+		var sqliteErr sqlite3.Error
+		if errors.As(err, &sqliteErr) {
+			if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`
+					<div id="alert" class="alert" hx-swap-oob="true">
+						This username is already taken
+					</div>
+				`))
+				return
+			}
+		}
+		log.Printf("postInvitation.createUser: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	tokenBytes := make([]byte, 32)
+	_, err = rand.Read(tokenBytes)
+	if err != nil {
+		log.Printf("postInvitation.Read: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	csrfTokenBytes := make([]byte, 32)
+	_, err = rand.Read(csrfTokenBytes)
+	if err != nil {
+		log.Printf("postInvitation.Read2: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	token := base64.StdEncoding.EncodeToString(tokenBytes)
+	csrfToken := base64.StdEncoding.EncodeToString(csrfTokenBytes)
+
+	err = createSession(tx, token, csrfToken, userID)
+	if err != nil {
+		log.Printf("postInvitation.createSession: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Printf("postInvitation.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(
+		w,
+		&http.Cookie{
+			Name:     "session",
+			Value:    token,
+			Path:     "/",
+			Expires:  time.Now().UTC().Add(time.Hour * 876600),
+			Secure:   BUILD == "release",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		},
+	)
+
+	w.Header().Add("HX-Location", "/admin/alerts")
+}
+
 func getOngoingAlerts(tx *sql.Tx) ([]AlertDetail, error) {
 	const alertQuery = `
 		select 
@@ -4494,7 +4829,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 
 	authCtx := getAuthCtx(r)
 	if authCtx.ID != 0 {
-		http.Redirect(w, r, "/admin", http.StatusFound)
+		http.Redirect(w, r, "/admin/alerts", http.StatusFound)
 		return
 	}
 
@@ -4613,7 +4948,7 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		},
 	)
 
-	w.Header().Add("HX-Location", "/admin")
+	w.Header().Add("HX-Location", "/admin/alerts")
 }
 
 func adminIndex(w http.ResponseWriter, r *http.Request) {
@@ -9735,7 +10070,7 @@ func deleteAlertMessageByID(tx *sql.Tx, alertID int, messageID int) error {
 
 	_, err := tx.Exec(query, alertID, messageID)
 	if err != nil {
-		return fmt.Errorf("deleteAlertMessageByID.Exec: %s", err)
+		return fmt.Errorf("deleteAlertMessageByID.Exec: %w", err)
 	}
 
 	return nil
@@ -13073,6 +13408,59 @@ func postUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func getSettings(w http.ResponseWriter, r *http.Request) {
+	refresh := r.URL.Query().Get("refresh") != ""
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("getSettings.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	users, err := listUsers(tx)
+	if err != nil {
+		log.Printf("getSettings.listUsers: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	invitations, err := listActiveUserInvitations(tx, time.Now().UTC().Add(-time.Hour*24))
+	if err != nil {
+		log.Printf("getSettings.listActiveUserInvitations: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("getSettings.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	type FormattedInvitation struct {
+		ID        int
+		Token     string
+		ExpiresIn string
+	}
+
+	formattedInvitations := make([]FormattedInvitation, 0, len(invitations))
+
+	for _, invitation := range invitations {
+		expiresIn := invitation.CreatedAt.Add(time.Hour * 24).Sub(time.Now().UTC())
+		h := int(expiresIn.Truncate(time.Hour).Hours())
+		m := int(expiresIn.Truncate(time.Minute).Minutes()) - (h * 60)
+		formattedInvitations = append(
+			formattedInvitations,
+			FormattedInvitation{
+				ID:        invitation.ID,
+				Token:     invitation.Token,
+				ExpiresIn: fmt.Sprintf("%dh %dm", h, m),
+			},
+		)
+	}
+
 	const markup = `
 		{{define "title"}}Settings{{end}}
 		{{define "body"}}
@@ -13185,6 +13573,160 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 						</div>
 					{{end}}
 				</form>
+
+				<div class="settings-users-header">
+					<h3>Users</h3>
+				</div>
+				<div
+					id="users-container" 
+					class="users-container"
+					{{if .Refresh}}hx-swap-oob="true"{{end}}
+				>
+					{{range $user := .Users}}
+						<div>
+							<div>
+								<span>{{$user.Username}}</span>
+							</div>
+							<div class="menu">
+								<button class="menu-button">
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+										<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
+									</svg>
+								</button>
+
+								<dialog>
+									<a href="/admin/settings/users/{{$user.ID}}/edit" hx-boost="true">Edit</a>
+									{{if ne $.Ctx.Auth.ID $user.ID }}
+										<button onclick="document.getElementById('dialog-{{$user.ID}}').showModal();">Delete</button>
+									{{end}}
+								</dialog>
+							</div>
+							<dialog class="modal" id="dialog-{{$user.ID}}">
+								<span>Delete {{$user.Username}}</span>
+								<form 
+									hx-delete="/admin/settings/users/{{$user.ID}}"
+									hx-swap="none"
+									hx-on::after-request="htmx.ajax('GET', '?refresh=true', {swap: 'none'});"
+								>
+									<div>
+										<button onclick="document.getElementById('dialog-{{$user.ID}}').close(); return false;">Cancel</button>
+										<button><span></span>Delete</button>
+									</div>
+								</form>
+							</dialog>
+						</div>
+					{{end}}
+
+					{{if .Refresh}}
+						<script>
+							[...document.querySelectorAll("#users-container .menu-button")].forEach(function(e) {
+								e.addEventListener("click", function() {
+									const options = e.closest(".menu").querySelector("dialog");
+									if (!options.open) {
+										[...document.querySelectorAll("dialog:not(.modal)")].forEach(e => {e.close();});
+										options.show();
+										document.addEventListener("click", onClick);
+									} else {
+										options.close();
+									}
+								});
+							});
+						</script>
+					{{end}}
+				</div>
+
+				<div class="settings-users-header">
+					<h3>Invitations</h3>
+
+					<a
+						hx-post="/admin/settings/users/invite"
+						hx-swap="none"
+						hx-on::after-request="htmx.ajax('GET', '?refresh=true', {swap: 'none'});"
+					>
+						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+							<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+						</svg>
+					</a>
+				</div>
+				<div 
+					id="invites-container"
+					class="users-container"
+					{{if .Refresh}}hx-swap-oob="true"{{end}}
+				>
+					{{if len .Invitations}}
+						{{range $invite := .Invitations}}
+							<div>
+								<div>
+									<span>https://{{$.Ctx.Domain}}/invitation/{{$invite.Token}}</span>
+									<span>Expires in {{$invite.ExpiresIn}}</span>
+								</div>
+								<div class="menu">
+									<button class="menu-button">
+										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+											<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
+										</svg>
+									</button>
+
+									<dialog>
+										<button 
+											href="/admin/settings/users/{{$invite.ID}}/edit"
+											onclick="navigator.clipboard.writeText('https://{{$.Ctx.Domain}}/invitation/{{$invite.Token}}');"
+										>
+											Copy
+										</button>
+										<button onclick="document.getElementById('invitation-dialog-{{$invite.ID}}').showModal();">Delete</button>
+									</dialog>
+								</div>
+								<dialog class="modal" id="invitation-dialog-{{$invite.ID}}">
+									<span>Delete invite</span>
+									<form 
+										hx-delete="/admin/settings/users/invite/{{$invite.ID}}"
+										hx-swap="none"
+										hx-on::after-request="htmx.ajax('GET', '?refresh=true', {swap: 'none'});"
+									>
+										<div>
+											<button onclick="document.getElementById('invitation-dialog-{{$invite.ID}}').close(); return false;">Cancel</button>
+											<button><span></span>Delete</button>
+										</div>
+									</form>
+								</dialog>
+							</div>
+						{{end}}
+					{{else}}
+						<div class="entity-empty-state">
+							<div class="icon">
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+									<path d="M8 8a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM3.156 11.763c.16-.629.44-1.21.813-1.72a2.5 2.5 0 0 0-2.725 1.377c-.136.287.102.58.418.58h1.449c.01-.077.025-.156.045-.237ZM12.847 11.763c.02.08.036.16.046.237h1.446c.316 0 .554-.293.417-.579a2.5 2.5 0 0 0-2.722-1.378c.374.51.653 1.09.813 1.72ZM14 7.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0ZM3.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM5 13c-.552 0-1.013-.455-.876-.99a4.002 4.002 0 0 1 7.753 0c.136.535-.324.99-.877.99H5Z" />
+								</svg>
+							</div>
+							<span>Invite another admin</span>
+							<a 
+								class="action"
+								hx-post="/admin/settings/users/invite"
+								hx-swap="none"
+								hx-on::after-request="htmx.ajax('GET', '?refresh=true', {swap: 'none'});"
+							>
+								Create invite
+							</a>
+						</div>
+					{{end}}
+					{{if .Refresh}}
+						<script>
+							[...document.querySelectorAll("#invites-container .menu-button")].forEach(function(e) {
+								e.addEventListener("click", function() {
+									const options = e.closest(".menu").querySelector("dialog");
+									if (!options.open) {
+										[...document.querySelectorAll("dialog:not(.modal)")].forEach(e => {e.close();});
+										options.show();
+										document.addEventListener("click", onClick);
+									} else {
+										options.close();
+									}
+								});
+							});
+						</script>
+					{{end}}
+				</div>
 			</div>
 		{{end}}
 	`
@@ -13201,10 +13743,16 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		struct {
 			CurrentVersion string
 			Domain         string
+			Users          []SettingsUser
+			Invitations    []FormattedInvitation
+			Refresh        bool
 			Ctx            pageCtx
 		}{
 			CurrentVersion: VERSION,
 			Domain:         metaDomain,
+			Users:          users,
+			Invitations:    formattedInvitations,
+			Refresh:        refresh,
 			Ctx:            getPageCtx(r),
 		},
 	)
@@ -13620,6 +14168,391 @@ func postSettingsCancelDomain(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("HX-Location", "/admin/settings")
 }
 
+func getEditUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("getEditUser.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	username, err := getUsernameByID(tx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		log.Printf("getEditUser.getUsernameByID: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	const markup = `
+		{{define "title"}}Edit user{{end}}
+		{{define "body"}}
+			<div class="create-service-container">
+				<div class="admin-nav-header">
+					<div>
+						<a href="/admin/settings" hx-boost="true">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
+							</svg>
+						 </a>
+				  
+						<h2>Edit user</h2>
+					</div>
+				</div>
+
+				<form onsubmit="clearAlerts(this);" hx-post hx-swap="none" autocomplete="off">
+					<div id="username-alert"></div>
+					<label>
+						Username
+						<input name="username" value="{{.Username}}" required>
+					</label>
+
+					<div id="password-alert"></div>
+					<label>
+						Password
+						<input name="password" type="password" value="retain" required>
+					</label>
+
+					<div>
+						<button type="submit">Edit</button>
+					</div>
+				</form>
+				<script>
+					function clearAlerts(e) {
+						[...e.querySelectorAll(".alert")].forEach(v => {
+							v.style.display = "none";
+						});
+					}
+				</script>
+			</div>
+		{{end}}
+	`
+
+	tmpl, err := parseTmpl("getEditUser", markup)
+	if err != nil {
+		log.Printf("getEditUser.parseTmpl: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tmpl.Execute(
+		w,
+		struct {
+			Username string
+			Ctx      pageCtx
+		}{
+			Username: username,
+			Ctx:      getPageCtx(r),
+		},
+	)
+	if err != nil {
+		log.Printf("getEditUser.Execute: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func postEditUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	username := r.PostFormValue("username")
+	if username == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	password := r.PostFormValue("password")
+	if password == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if password != "retain" && len(password) < 8 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="password-alert" class="alert alert--field" hx-swap-oob="true">
+				Password must contain at least 8 characters
+			</div>
+		`))
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postEditUser.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = getUsernameByID(tx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		log.Printf("postEditUser.getUsernameByID: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if password != "retain" {
+		pwHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("postEditUser.GenerateFromPassword: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = editUser(tx, id, username, string(pwHash))
+		if err != nil {
+			var sqliteErr sqlite3.Error
+			if errors.As(err, &sqliteErr) {
+				if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+					w.WriteHeader(http.StatusBadRequest)
+					w.Write([]byte(`
+						<div id="username-alert" class="alert alert--field" hx-swap-oob="true">
+							This username is already taken
+						</div>
+					`))
+					return
+				}
+			}
+			log.Printf("postEditUser.editUser: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = deleteAllSessionsByUserID(tx, id)
+		if err != nil {
+			log.Printf("postEditUser.deleteAllSessionsByUserID: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	} else {
+		err = editUserUsername(tx, id, username)
+		if err != nil {
+			var sqliteErr sqlite3.Error
+			if errors.As(err, &sqliteErr) {
+				if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+					w.WriteHeader(http.StatusBadRequest)
+					w.Write([]byte(`
+						<div id="username-alert" class="alert alert--field" hx-swap-oob="true">
+							This username is already taken
+						</div>
+					`))
+					return
+				}
+			}
+			log.Printf("postEditUser.editUserUsername: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postEditUser.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	authCtx := getAuthCtx(r)
+
+	if authCtx.ID == id && password != "retain" {
+		w.Header().Add("HX-Location", "/login")
+	} else {
+		w.Header().Add("HX-Location", "/admin/settings")
+	}
+}
+
+func deleteUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	authCtx := getAuthCtx(r)
+	if authCtx.ID == id {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("deleteUser.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	err = deleteUserByID(tx, id)
+	if err != nil {
+		log.Printf("deleteUser.deleteUserByID: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("deleteUser.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+type UserInvitation struct {
+	ID        int
+	Token     string
+	CreatedAt time.Time
+}
+
+func listActiveUserInvitations(tx *sql.Tx, minTime time.Time) ([]UserInvitation, error) {
+	const query = `
+		select id, token, created_at from user_invitation
+		where created_at > ?
+		order by id desc
+	`
+
+	invs := []UserInvitation{}
+
+	rows, err := tx.Query(query, minTime)
+	if err != nil {
+		return invs, fmt.Errorf("listActiveUserInvitations.Query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var inv UserInvitation
+		err := rows.Scan(&inv.ID, &inv.Token, &inv.CreatedAt)
+		if err != nil {
+			return invs, fmt.Errorf("listActiveUserInvitations.Scan: %w", err)
+		}
+
+		invs = append(invs, inv)
+	}
+
+	return invs, nil
+}
+
+func validateUserInvitationToken(tx *sql.Tx, token string, minTime time.Time) (int, error) {
+	const query = `
+		select id from user_invitation where token = ? and created_at > ?
+	`
+
+	var id int
+	err := tx.QueryRow(query, token, minTime).Scan(&id)
+	if err != nil {
+		return id, fmt.Errorf("validateUserInvitationToken.Scan: %w", err)
+	}
+
+	return id, nil
+}
+
+func createUserInvitation(tx *sql.Tx, token string, createdAt time.Time) error {
+	const query = `
+		insert into user_invitation(token, created_at) values(?, ?)
+	`
+
+	_, err := tx.Exec(query, token, createdAt)
+	if err != nil {
+		return fmt.Errorf("createUserInvitation.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func deleteUserInvitation(tx *sql.Tx, id int) error {
+	const query = `
+		delete from user_invitation where id = ?
+	`
+
+	_, err := tx.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("deleteUserInvitation.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func postInviteUser(w http.ResponseWriter, r *http.Request) {
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postInviteUser.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	tokenBytes := make([]byte, 32)
+	_, err = rand.Read(tokenBytes)
+	if err != nil {
+		log.Printf("postInviteUser.Read: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	token := base64.URLEncoding.EncodeToString(tokenBytes)
+
+	err = createUserInvitation(tx, token, time.Now().UTC())
+	if err != nil {
+		log.Printf("postInviteUser.createUserInvitation: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postInviteUser.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func postDeleteInvite(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postDeleteInvite.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	err = deleteUserInvitation(tx, id)
+	if err != nil {
+		log.Printf("postDeleteInvite.deleteUserInvitation: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postDeleteInvite.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
 func createSession(tx *sql.Tx, token string, csrfToken string, userID int) error {
 	const query = `
 		insert into session(token, csrf_token, user_id) values(?, ?, ?)
@@ -13651,6 +14584,37 @@ func validateSession(tx *sql.Tx, token string) (int, string, error) {
 	return userID, csrfToken, nil
 }
 
+type SettingsUser struct {
+	ID       int
+	Username string
+}
+
+func listUsers(tx *sql.Tx) ([]SettingsUser, error) {
+	const query = `
+		select id, username from user
+	`
+
+	users := []SettingsUser{}
+
+	rows, err := tx.Query(query)
+	if err != nil {
+		return users, fmt.Errorf("listUsers.Query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var user SettingsUser
+		err := rows.Scan(&user.ID, &user.Username)
+		if err != nil {
+			return users, fmt.Errorf("listUsers.Scan: %w", err)
+		}
+
+		users = append(users, user)
+	}
+
+	return users, nil
+}
+
 func getPasswordHash(tx *sql.Tx, username string) (string, int, error) {
 	const query = `
 		select password, id
@@ -13668,6 +14632,20 @@ func getPasswordHash(tx *sql.Tx, username string) (string, int, error) {
 	return hash, userID, nil
 }
 
+func getUsernameByID(tx *sql.Tx, id int) (string, error) {
+	const query = `
+		select username from user where id = ?
+	`
+
+	username := ""
+	err := tx.QueryRow(query, id).Scan(&username)
+	if err != nil {
+		return username, fmt.Errorf("getUsernameByID.Scan: %w", err)
+	}
+
+	return username, nil
+}
+
 func deleteSession(tx *sql.Tx, token string) error {
 	const query = `
 		delete from session where token = ?
@@ -13675,6 +14653,18 @@ func deleteSession(tx *sql.Tx, token string) error {
 
 	if _, err := tx.Exec(query, token); err != nil {
 		return fmt.Errorf("deleteSession.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func deleteAllSessionsByUserID(tx *sql.Tx, id int) error {
+	const query = `
+		delete from session where user_id = ?
+	`
+
+	if _, err := tx.Exec(query, id); err != nil {
+		return fmt.Errorf("deleteAllSessionsByUserID.Exec: %w", err)
 	}
 
 	return nil
@@ -14284,10 +15274,49 @@ func createUser(tx *sql.Tx, username string, pwHash string) (int, error) {
 	row := tx.QueryRow(query, username, pwHash)
 	err := row.Scan(&userID)
 	if err != nil {
-		return userID, fmt.Errorf("postSetup.Scan: %s", err)
+		return userID, fmt.Errorf("createUser.Scan: %w", err)
 	}
 
 	return userID, nil
+}
+
+func editUserUsername(tx *sql.Tx, id int, username string) error {
+	const query = `
+		update user set username = ? where id = ?
+	`
+
+	_, err := tx.Exec(query, username, id)
+	if err != nil {
+		return fmt.Errorf("editUserUsername.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func editUser(tx *sql.Tx, id int, username string, pwHash string) error {
+	const query = `
+		update user set username = ?, password = ? where id = ?
+	`
+
+	_, err := tx.Exec(query, username, pwHash, id)
+	if err != nil {
+		return fmt.Errorf("editUser.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func deleteUserByID(tx *sql.Tx, id int) error {
+	const query = `
+		delete from user where id = ?
+	`
+
+	_, err := tx.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("deleteUserByID.Exec: %w", err)
+	}
+
+	return nil
 }
 
 func postSetupAccount(w http.ResponseWriter, r *http.Request) {
