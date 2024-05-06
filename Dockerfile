@@ -11,6 +11,8 @@ COPY *.go ./
 
 COPY static/ ./static
 
+COPY migrations/ ./migrations
+
 COPY schema.sql ./
 
 RUN apk add --update gcc musl-dev
