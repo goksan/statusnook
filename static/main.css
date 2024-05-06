@@ -120,6 +120,11 @@ label {
     padding: 0.8rem 1.2rem;
 }
 
+.alert--field {
+    margin-bottom: 1.4rem;
+    align-items: flex-start;
+}
+
 .alert--success {
     border: 1px solid #29AF5D;
     background: #15C95B;
@@ -2917,6 +2922,150 @@ label {
     margin-left: 1.4rem;
     padding: 0 2.0rem;
     color: #595959;
+}
+
+.settings-container h3 {
+    font-size: 1.4rem;
+    font-weight: 500;
+    color: #464646;
+    margin: 0;
+}
+
+.settings-users-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 2.0rem;
+    align-items: center;
+}
+  
+.settings-users-header h2 {
+    font-weight: 500;
+    font-size: 1.4rem;
+    color: #464646;
+    margin: 0;
+}
+  
+.settings-users-header a {
+    border-radius: 0.5rem;
+    border: 1px solid #E6E6E6;
+    background: #FBFBFB;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
+    display: flex;
+}
+  
+.settings-users-header a svg {
+    width: 1.2rem;
+    height: 1.2rem;
+    padding: 0.4rem;
+    color: #595959;
+}
+
+.users-container {
+    border: 1px solid #e6e6e6;
+    border-radius: 0.6rem;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
+    margin-bottom: 3.6rem;
+}
+
+.users-container > div:not(.entity-empty-state) {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #F6F6F6;
+    padding: 1.6rem;
+    min-height: 6.0rem;
+    box-sizing: border-box;
+}
+
+.users-container > div:last-of-type {
+    border: none;
+}
+
+.users-container > div > div {
+    display: flex;
+    justify-content: center;
+    flex-direction: column;
+}
+
+.users-container > div > div > span {
+    color: #606060;
+    font-size: 1.4rem;
+    font-weight: 500;
+}
+
+.users-container .menu button {
+    background-color: transparent;
+    border: none;
+    display: flex;
+    align-items: center;
+}
+
+.users-container .menu svg {
+    width: 1.2rem;
+    height: 1.2rem;
+    color: #595959;
+}
+
+.users-container > div > div > span:nth-of-type(2) {
+    color: #D0D0D0;
+    font-size: 1.4rem;
+    margin-top: 0.5rem;
+}
+
+.users-container .modal {
+    width: 36rem;
+}
+
+.users-container .modal {
+    border-radius: 1.2rem;
+    border: 1px solid #E6E6E6;
+    background: #FFF;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.10);
+    padding: 2.8rem;
+}
+
+.users-container .modal::backdrop {
+    background: rgba(0, 0, 0, 0.29);
+    backdrop-filter: blur(1.5px);
+}
+
+.users-container .modal span {
+    color: #2D2D2D;
+    font-size: 1.8rem;
+    font-weight: 600;
+}
+
+.users-container .modal > form {
+    margin-top: 6.6rem;
+}
+
+.users-container .modal > form > div {
+    display: flex;
+    gap: 1rem;
+}
+
+.users-container .modal > form button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 1rem 3.4rem;
+    border-radius: 0.4rem;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
+    font-weight: 600;
+    gap: 1rem;
+}
+
+.users-container .modal > form button:first-of-type {
+    border: 1px solid #E6E6E6;
+    color: #464646;
+    background-color: white;
+}
+
+.users-container .modal > form button:nth-of-type(2) {
+    background: #464646;
+    color: #FFF;
+    border: none;
 }
 /* settings */
 

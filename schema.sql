@@ -1,5 +1,3 @@
-begin transaction;
-
 create table meta(
     id integer primary key,
     name text not null unique,
@@ -17,11 +15,17 @@ create table user(
     password text not null
 );
 
+create table user_invitation(
+    id integer primary key,
+    token text not null unique,
+    created_at datetime not null
+);
+
 create table session(
     id integer primary key,
     token text not null unique,
     csrf_token text not null unique,
-    user_id int references user(id) not null
+    user_id int references user(id) on delete cascade not null
 );
 
 create table service(
@@ -163,6 +167,12 @@ create table mail_group_monitor(
     unique(mail_group_id, monitor_id)
 );
 
+create table migration(
+    id integer primary key,
+    name text not null unique,
+    skipped int not null
+);
+
 insert into
     service(name, helper_text)
 values
@@ -231,5 +241,3 @@ values
         'managed-subscriptions',
         true
     );
-
-commit;
