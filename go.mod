@@ -1,6 +1,6 @@
 module github.com/goksan/statusnook
 
-go 1.21
+go 1.22
 
 require (
 	github.com/caddyserver/certmagic v0.20.0
@@ -10,6 +10,7 @@ require (
 	github.com/miekg/dns v1.1.55
 	golang.org/x/crypto v0.18.0
 	golang.org/x/mod v0.11.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

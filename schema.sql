@@ -30,6 +30,7 @@ create table session(
 
 create table service(
     id integer primary key,
+    slug text not null unique,
     name text not null,
     helper_text text not null
 );
@@ -81,11 +82,6 @@ create table alert_setting(
     value text not null
 );
 
-create table alert_setting_smtp_notification(
-    id integer primary key,
-    notification_channel_id int references notification_channel(id) on delete cascade not null unique
-);
-
 create table pending_email_alert_subscription(
     id integer primary key,
     token string not null,
@@ -102,6 +98,7 @@ create table alert_service(
 
 create table monitor(
     id integer primary key,
+    slug text not null unique,
     name text not null,
     url text not null,
     method text not null,
@@ -135,6 +132,7 @@ create table monitor_log_last_checked(
 
 create table notification_channel(
     id integer primary key,
+    slug text not null unique,
     name text not null,
     type text not null check(type in ('smtp', 'slack')),
     details text not null
@@ -147,8 +145,14 @@ create table monitor_notification_channel(
     unique(monitor_id, notification_channel_id)
 );
 
+create table alert_setting_smtp_notification(
+    id integer primary key,
+    notification_channel_id int references notification_channel(id) on delete cascade not null unique
+);
+
 create table mail_group(
     id integer primary key,
+    slug text not null unique,
     name text not null,
     description text
 );
@@ -174,9 +178,10 @@ create table migration(
 );
 
 insert into
-    service(name, helper_text)
+    service(slug, name, helper_text)
 values
     (
+        'website',
         'Website',
         'Edit or delete this service in the admin area'
     );

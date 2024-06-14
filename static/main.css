@@ -610,7 +610,7 @@ label {
     border: none;
 }
 
-.param-box__inputs:disabled {
+.param-box__inputs:not(.view-only):disabled {
     display: none;
 }
 
@@ -1572,6 +1572,7 @@ label {
 }
 
 .menu > dialog {
+    overflow: hidden;
     position: absolute;
     border-radius: 0.4rem;
     border: 1px solid #E6E6E6;
@@ -2293,7 +2294,7 @@ label {
     box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
 }
 
-.notifications-list > div {
+.notifications-list > * {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2301,36 +2302,53 @@ label {
     padding: 1.6rem;
     min-height: 7.4rem;
     box-sizing: border-box;
+    text-decoration: none;
 }
 
-.notifications-list > div:last-of-type {
+.notifications-list > :first-child {
+    border-top-left-radius: 0.6rem;
+    border-top-right-radius: 0.6rem;
+}
+
+.notifications-list > :last-child {
+    border-bottom-right-radius: 0.6rem;
+    border-bottom-left-radius: 0.6rem;
+}
+
+.notifications-list > a:hover {
+    background-color: #FBFBFB;
+    transition: background-color 0.06s ease-in;
+}
+
+.notifications-list > *:last-of-type {
     border-bottom: none;
 }
 
-.notifications-list > div > div {
+.notifications-list > * > div {
     display: flex;
+    text-decoration: none;
 }
 
-.notifications-list > div > div > svg {
+.notifications-list > * > div > svg {
     width: 2.2rem;
     height: 2.2rem;
     margin-right: 1.6rem;
     color: #595959;
 }
 
-.notifications-list > div > div > div {
+.notifications-list > * > div > div {
     display: flex;
     flex-direction: column;
     justify-content: center;
     row-gap: 0.5rem;
 }
 
-.notifications-list > div > div > div > span {
+.notifications-list > * > div > div > span {
     color: #D0D0D0;
     font-size: 1.4rem;
 }
 
-.notifications-list > div > div > div > span:first-of-type {
+.notifications-list > * > div > div > span:first-of-type {
     color: #606060;
     font-size: 1.4rem;
     font-weight: 500;
@@ -2504,6 +2522,7 @@ label {
 }
 
 .slack-container p {
+    margin-top: 0;
     font-size: 1.4rem;
     color: #606060;
 }
@@ -2528,6 +2547,11 @@ label {
 .slack-tutorial, .slack-tutorial-app {
     display: none;
     margin-top: 0.8rem;
+    margin-bottom: 3.6rem;
+}
+
+.slack-tutorial :last-child {
+    margin: 0;
 }
 
 .slack-tutorial--visible, .slack-tutorial-app--visible {
@@ -2945,20 +2969,49 @@ label {
     color: #464646;
     margin: 0;
 }
+
+.settings-users-header > div {
+    display: flex;
+    align-items: center;
+}
   
-.settings-users-header a {
+.settings-users-header > a {
     border-radius: 0.5rem;
     border: 1px solid #E6E6E6;
     background: #FBFBFB;
     box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
     display: flex;
+    padding: 0;
 }
-  
-.settings-users-header a svg {
+
+.settings-users-header > a svg, .settings-users-header button svg {
     width: 1.2rem;
     height: 1.2rem;
     padding: 0.4rem;
     color: #595959;
+}
+
+.settings-users-header dialog {
+    z-index: 36;
+}
+
+.settings-users-header__git {
+    display: flex;
+    align-items: center;
+    margin-right: 1.2rem;
+}
+
+.settings-users-header__git svg {
+    width: 1.2rem;
+    height: 1.2rem;
+    margin-right: 0.6rem;
+    color: #1AD47B;
+}
+
+.settings-users-header__git a {
+    color: #D0D0D0;
+    font-size: 1.2rem;
+    text-decoration: none;
 }
 
 .users-container {
@@ -3067,6 +3120,292 @@ label {
     background: #464646;
     color: #FFF;
     border: none;
+}
+
+.modal.secrets-modal {
+    width: 36rem;
+}
+
+.modal.secrets-modal {
+    border-radius: 1.2rem;
+    border: 1px solid #E6E6E6;
+    background: #FFF;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.10);
+    padding: 2.8rem;
+}
+
+.modal.secrets-modal::backdrop {
+    background: rgba(0, 0, 0, 0.29);
+    backdrop-filter: blur(1.5px);
+}
+
+.modal.secrets-modal > div {
+    display: flex;
+    justify-content: space-between;
+}
+
+.modal.secrets-modal > div button {
+    display: flex;
+    align-items: center;
+    padding: 0;
+    background-color: transparent;
+    border: none;
+}
+
+.modal.secrets-modal > div svg {
+    width: 1.8rem;
+    height: 1.8rem;
+    color: #969696;
+}
+
+.modal.secrets-modal span {
+    color: #2D2D2D;
+    font-size: 1.8rem;
+    font-weight: 600;
+}
+
+.modal.secrets-modal > form {
+    margin-top: 2.8rem;
+}
+
+.modal.secrets-modal > form button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 1rem 1.4rem;
+    border-radius: 0.4rem;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
+    font-weight: 600;
+    gap: 1rem;
+}
+
+.modal.secrets-modal > form > div:last-of-type > button:first-of-type {
+    background: #464646;
+    color: #FFF;
+    border: none;
+}
+
+.modal.secrets-modal > form button:nth-of-type(2) {
+    border: 1px solid #E6E6E6;
+    color: #464646;
+    background-color: white;
+}
+
+.secrets-modal form > div:first-of-type {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 4.6rem;
+}
+
+.secrets-modal form > div:first-of-type div {
+    margin-top: 1.0rem;
+    display: flex;
+    gap: 1.0rem;
+}
+
+.secrets-modal form > div:first-of-type button {
+    display: flex;
+    border-radius: 0.5rem;
+    border: 1px solid #F3F3F3;
+    background-color: white;
+    color: #444444;
+    padding: 1.0rem;
+    align-self: flex-start;
+    transition: transform 200ms, background-color 100ms;
+    width: auto;
+}
+
+
+.secrets-modal form > div:first-of-type button:hover {
+    background-color: #FAFAFA;
+}
+
+.secrets-modal form > div:first-of-type button svg:nth-of-type(2) {
+    display: none;
+}
+
+.secrets-modal form > div:first-of-type button.copy-success svg:first-of-type {
+    display: none;
+}
+
+.secrets-modal form > div:first-of-type button.copy-success svg:nth-of-type(2) {
+    display: block;
+}
+
+.secrets-modal form > div:first-of-type svg {
+    width: 1.8rem;
+    height: 1.8rem;
+}
+
+.secrets-modal form > div:nth-of-type(2) {
+    display: flex;
+    gap: 1rem;
+    height: 100%;
+}
+
+.secrets-modal form input {
+   margin: 0;
+}
+
+.save-overlay {
+    display: none;
+    gap: 4.0rem;
+    align-items: center;
+    font-size: 1.4rem;
+    position: absolute;
+    z-index: 5;
+    background-color: #252526;
+    right: 14px;
+    top: 14px;
+    border-radius: 0.2rem;
+    padding: 0.8rem;
+    color: #cccccc;
+    font-weight: 500;
+    border-left: 2px solid #314fee;
+    box-shadow: 0 0 8px 2px rgba(0, 0, 0, 0.36)
+}
+
+.save-overlay--error {
+    border-color: #ee3131;
+    position: static;
+    display: flex;
+    max-width: 32rem;
+}
+
+.save-overlay-errors {
+    display: flex;
+    flex-direction: column;
+    position: absolute;
+    right: 14px;
+    top: 66px;
+    z-index: 5;
+    gap: 0.8rem;
+}
+
+.save-overlay button {
+    border-radius: 0.5rem;
+    display: flex;
+    padding: 0;
+    border: none;
+    background-color: transparent;
+}
+
+.save-overlay button:hover {
+    background-color: #363737;
+}
+
+.save-overlay button svg {
+    width: 1.6rem;
+    height: 1.6rem;
+    padding: 0.3rem;
+    color: #cccccc;
+}
+
+.github-webhook-secret-container {
+    display: flex;
+    gap: 1.0rem;
+    margin: 1.0rem 0 3.6rem 0;
+}
+
+.github-webhook-secret-container > input {
+    margin: 0;
+}
+
+
+.github-webhook-secret-container > button, .github-webhook-secret-container > .checkbox {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.0rem;
+    border-radius: 0.5rem;
+    border: 1px solid #E6E6E6;
+    background-color: white;
+    color: #444444;
+    padding: 1.0rem;
+    transition: transform 200ms, background-color 100ms;
+}
+
+
+.github-webhook-secret-container > button:hover, .github-webhook-secret-container > .checkbox:hover {
+    background-color: #FAFAFA;
+}
+
+.github-webhook-secret-container button svg {
+    width: 1.4rem;
+    height: 1.4rem;
+}
+
+.generate-new-webhook-secret.modal {
+    width: 36rem;
+    border-radius: 1.2rem;
+    border: 1px solid #E6E6E6;
+    background: #FFF;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.10);
+    padding: 2.8rem;
+}
+
+.generate-new-webhook-secret.modal::backdrop {
+    background: rgba(0, 0, 0, 0.29);
+    backdrop-filter: blur(1.5px);
+}
+
+.generate-new-webhook-secret.modal span:first-of-type {
+    display: block;
+    color: #2D2D2D;
+    font-size: 1.8rem;
+    font-weight: 600;
+    margin-bottom: 1.0rem;
+}
+
+.generate-new-webhook-secret.modal span:nth-of-type(2) {
+    display: block;
+    color: #747474;
+    font-size: 1.4rem;
+    font-weight: 400;
+}
+
+.generate-new-webhook-secret.modal > form {
+    margin-top: 6.6rem;
+}
+
+.generate-new-webhook-secret.modal > form > div {
+    display: flex;
+    gap: 1rem;
+}
+
+.generate-new-webhook-secret.modal > form button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 1rem 3.4rem;
+    border-radius: 0.4rem;
+    box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
+    font-weight: 600;
+    gap: 1rem;
+}
+
+.generate-new-webhook-secret.modal > form button:first-of-type {
+    border: 1px solid #E6E6E6;
+    color: #464646;
+    background-color: white;
+}
+
+.generate-new-webhook-secret.modal > form button:nth-of-type(2) {
+    background: #464646;
+    color: #FFF;
+    border: none;
+}
+
+.github-config {
+    margin: 0;
+    padding: 0;
+    border: none;
+}
+
+.github-config:disabled {
+    display: none;
 }
 /* settings */
 
