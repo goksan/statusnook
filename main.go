@@ -396,11 +396,11 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 											Notifications
 										</a>
 
-										<div class="menu">
+										<div id="nav-menu" class="menu" hx-preserve>
 											<button class="menu-button">
 												<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
 													<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-												</svg>										  
+												</svg>                                        
 											</button>
 
 											<dialog>
@@ -437,8 +437,16 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 					}
 
 					[...document.querySelectorAll(".menu-button")].forEach(function(e) {
+						const menu = e.closest(".menu");
+						if (menu.hasAttribute("hx-preserve")) {
+							if (menu.dataset.preserve) {
+								return;
+							}
+							menu.dataset.preserve = true;
+						}
+
 						e.addEventListener("click", function() {
-							const options = e.closest(".menu").querySelector("dialog");
+							const options = menu.querySelector("dialog");
 							if (!options.open) {
 								[...document.querySelectorAll("dialog:not(.modal)")].forEach(e => {e.close();});
 								options.show();
@@ -5505,6 +5513,13 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, ok := r.URL.Query()["ready"]; ok {
+		if len(monitorLogs) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
 	const markup = `
 		{{define "title"}}{{.Monitor.Name}} - Monitor{{end}}
 		{{define "body"}}
@@ -5534,7 +5549,7 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 							{{end}}
 						</div>
 						<div>
-							<div class="menu">
+							<div id="get-monitor-menu" class="menu" hx-preserve>
 								<button class="menu-button">
 									<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none">
 										<path d="M5.99961 1.80005C6.2383 1.80005 6.46722 1.89487 6.63601 2.06365C6.80479 2.23244 6.89961 2.46135 6.89961 2.70005C6.89961 2.93874 6.80479 3.16766 6.63601 3.33645C6.46722 3.50523 6.2383 3.60005 5.99961 3.60005C5.76091 3.60005 5.532 3.50523 5.36321 3.33645C5.19443 3.16766 5.09961 2.93874 5.09961 2.70005C5.09961 2.46135 5.19443 2.23244 5.36321 2.06365C5.532 1.89487 5.76091 1.80005 5.99961 1.80005ZM5.99961 5.10005C6.2383 5.10005 6.46722 5.19487 6.63601 5.36365C6.80479 5.53244 6.89961 5.76135 6.89961 6.00005C6.89961 6.23874 6.80479 6.46766 6.63601 6.63645C6.46722 6.80523 6.2383 6.90005 5.99961 6.90005C5.76091 6.90005 5.532 6.80523 5.36321 6.63645C5.19443 6.46766 5.09961 6.23874 5.09961 6.00005C5.09961 5.76135 5.19443 5.53244 5.36321 5.36365C5.532 5.19487 5.76091 5.10005 5.99961 5.10005ZM6.89961 9.30005C6.89961 9.06135 6.80479 8.83244 6.63601 8.66365C6.46722 8.49487 6.2383 8.40005 5.99961 8.40005C5.76091 8.40005 5.532 8.49487 5.36321 8.66365C5.19443 8.83244 5.09961 9.06135 5.09961 9.30005C5.09961 9.53874 5.19443 9.76766 5.36321 9.93645C5.532 10.1052 5.76091 10.2 5.99961 10.2C6.2383 10.2 6.46722 10.1052 6.63601 9.93645C6.80479 9.76766 6.89961 9.53874 6.89961 9.30005Z" fill="#595959"/>
@@ -5573,7 +5588,7 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 					</form>
 				</div>
 
-				<div id="monitor-time" class="monitor-time">
+				<div id="monitor-time" class="monitor-time" hx-preserve>
 					<span id="loader" class="loader"></span>
 				</div>
 
@@ -5617,16 +5632,16 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 						{{end}}
 					</div>
 				{{else}}
-					<div 
+					<div
 						class="entity-empty-state"
-						hx-get="/admin/monitors/{{.Monitor.ID}}"
-						hx-trigger="load delay:500ms"
+						hx-get="/admin/monitors/{{.Monitor.ID}}?ready"
+						hx-trigger="every 500ms"
 						hx-target="body"
 					>
 						<div class="icon">
 							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
 								<path fill-rule="evenodd" d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z" clip-rule="evenodd" />
-					  		</svg>
+							</svg>
 						</div>
 						<span>Getting first logs...</span>
 					</div>
