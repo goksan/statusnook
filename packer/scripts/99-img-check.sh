@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # Copyright (c) 2024 Goksan
-# The original content was modified to add "find /var/log -mtime -1 -type f -exec truncate -s 0 {} \;" on line 608
 
 # DigitalOcean Marketplace Image Validation Tool
 # © 2021-2022 DigitalOcean LLC.
@@ -510,7 +509,7 @@ osv=0
 
 if [[ $OS == "Ubuntu" ]]; then
         ost=1
-    if [[ $VER == "22.10" ]] || [[ $VER == "22.04" ]] || [[ $VER == "20.04" ]] || [[ $VER == "18.04" ]] || [[ $VER == "16.04" ]]; then
+    if [[ $VER == "24.04" ]] || [[ $VER == "22.10" ]] || [[ $VER == "22.04" ]] || [[ $VER == "20.04" ]] || [[ $VER == "18.04" ]] || [[ $VER == "16.04" ]]; then
         osv=1
     fi
 

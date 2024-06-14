@@ -14,7 +14,7 @@ packer {
 
 source "digitalocean" "statusnook" {
     api_token    = var.token
-    image        = "ubuntu-22-04-x64"
+    image        = "ubuntu-24-04-x64"
     region       = "fra1"
     size         = "s-1vcpu-512mb-10gb"
     ssh_username = "root"
