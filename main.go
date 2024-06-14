@@ -9545,6 +9545,11 @@ func createMonitor(
 }
 
 func postCreateMonitor(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	if name == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -12202,6 +12207,11 @@ func createService(tx *sql.Tx, slug string, name string, helperText string) erro
 }
 
 func postCreateService(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	helperText := r.PostFormValue("helper")
 
@@ -13211,6 +13221,11 @@ func createNotification(
 }
 
 func postCreateNotification(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	notificationType := r.PostFormValue("type")
 	if notificationType != "smtp" && notificationType != "slack" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -14792,6 +14807,11 @@ func updateMailGroupMembers(tx *sql.Tx, id int, members []string) error {
 }
 
 func postCreateMailGroup(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	if name == "" {
 		w.WriteHeader(http.StatusBadRequest)
