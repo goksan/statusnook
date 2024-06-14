@@ -64,4 +64,4 @@ systemctl start statusnook
 echo "Self-signed certificate SHA-256 fingerprint: $(su - statusnook -c "/home/statusnook/statusnook -generate-self-signed-cert")"
 
 echo -e '\n\033[0;32mStatusnook successfully installed!\033[0m'
-echo "To finalize your Statusnook instance setup, navigate to http://<your-ip-address-or-domain> in a web browser"
+echo "To finalize your Statusnook instance setup, navigate to https://<your-ip-address-or-domain> in a web browser"
