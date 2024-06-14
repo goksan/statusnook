@@ -2835,6 +2835,7 @@ label {
 
 .settings-container .edit-row input:disabled {
     border: none;
+    background-color: transparent;
     padding: 0;
     color: black;
     box-shadow: none;
