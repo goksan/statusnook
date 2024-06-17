@@ -68,6 +68,13 @@ docker compose up
 ### Binaries
 amd64 and arm64 Linux binaries can be found on the [Releases](https://github.com/goksan/Statusnook/releases) page.
 
+## Configuration
+Statusnook has the following configuration options:
+* Web UI based config
+* Text based config (YAML) via the settings page, or on push via GitHub
+  
+[Learn more about configuration](docs/configuration.md)
+
 ## Gallery
 
 ![monitors](https://github.com/goksan/statusnook/assets/17437810/9bc9a023-41fc-4646-a353-0a1755ce148b)
