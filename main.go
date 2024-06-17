@@ -13781,7 +13781,7 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 
 func postSettings(w http.ResponseWriter, r *http.Request) {
 	name := r.PostFormValue("name")
-	domain := r.PostFormValue("domain")
+	domain := strings.ToLower(r.PostFormValue("domain"))
 
 	if name != "" {
 		tx, err := rwDB.Begin()
@@ -15024,7 +15024,7 @@ var acmeProblemTypeMessages = map[string]string{
 }
 
 func postSetupDomain(w http.ResponseWriter, r *http.Request) {
-	domainParam := r.PostFormValue("domain")
+	domainParam := strings.ToLower(r.PostFormValue("domain"))
 	if domainParam == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`
@@ -15190,19 +15190,18 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 }
 
 func postSetupDomainSkip(w http.ResponseWriter, r *http.Request) {
-	domainParam := r.PostFormValue("domain")
+	domainParam := strings.ToLower(r.PostFormValue("domain"))
 	if domainParam == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	domain, err := url.ParseRequestURI("https://" + domainParam)
-	if err != nil {
+	domainPattern := regexp.MustCompile(`^[a-z0-9]+(?:[\-.][a-z0-9]+)*\.[a-z]+$`)
+
+	if !domainPattern.MatchString(domainParam) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	hostname := domain.Hostname()
 
 	tx, err := rwDB.Begin()
 	if err != nil {
@@ -15212,7 +15211,7 @@ func postSetupDomainSkip(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	err = updateMetaValue(tx, "unconfirmedDomain", hostname)
+	err = updateMetaValue(tx, "unconfirmedDomain", domainParam)
 	if err != nil {
 		log.Printf("postSetupDomainSkip.updateMetaValueName: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -15233,7 +15232,7 @@ func postSetupDomainSkip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metaSetup = "account"
-	metaUnconfirmedDomain = hostname
+	metaUnconfirmedDomain = domainParam
 
 	appWg.Add(1)
 	go monitorUnconfirmedDomainLoop(appCtx, &appWg)
