@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -13918,6 +13919,38 @@ func postSettings(w http.ResponseWriter, r *http.Request) {
 			metaUnconfirmedDomain = domain
 		}
 
+		domainPattern := regexp.MustCompile(`^[a-z0-9]+(?:[\-.][a-z0-9]+)*\.[a-z]+$`)
+
+		if strings.Contains(domain, "/") {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`
+				<div id="banner" class="banner" hx-swap-oob="true">
+					It looks like you've entered a URL, please enter a domain
+				</div>
+			`))
+			return
+		}
+
+		if net.ParseIP(domain).String() != "<nil>" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`
+				<div id="banner" class="banner" hx-swap-oob="true">
+					It looks like you've entered an IP address, please enter a domain
+				</div>
+			`))
+			return
+		}
+
+		if !domainPattern.MatchString(domain) {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`
+				<div id="banner" class="banner" hx-swap-oob="true">
+					Invalid domain
+				</div>
+			`))
+			return
+		}
+
 		found, err := lookupDomain(domain)
 		if err != nil {
 			log.Printf("postSettings.lookupDomain: %s", err)
@@ -14712,7 +14745,7 @@ func getSetupDomain(w http.ResponseWriter, r *http.Request) {
 							<p>A certificate will be obtained via Let's Encrypt and automatically configured</p>
 						</div>
 
-						<form onsubmit="onDomainSubmit();" class="setup-domain" hx-post hx-swap="none">
+						<form onsubmit="onDomainSubmit(this);" class="setup-domain" hx-post hx-swap="none">
 							<div class="domain-alerts">
 								<div id="alert"  class="alert domain-alert"></div>
 								<div class="alert alert--info domain-alert"></div>
@@ -14775,11 +14808,12 @@ func getSetupDomain(w http.ResponseWriter, r *http.Request) {
 			</div>
 
 			<script>
-				function onDomainSubmit() {
+				function onDomainSubmit(el) {
 					const skipDomainSetupEl = document.querySelector(".skip-domain-setup");
 					if (skipDomainSetupEl) {
 						skipDomainSetupEl.innerHTML = "";
 					}
+					el.elements.domain.readOnly = true;
 				}
 
 				function onDomainChange() {
@@ -14866,6 +14900,8 @@ func getSetupDomain(w http.ResponseWriter, r *http.Request) {
 				document.addEventListener('htmx:afterRequest', async function(evt) {
 					const form = document.querySelector("form");
 					const dev = {{.DEV}};
+
+					form.elements.domain.readOnly = false;
 					
 					if (evt.detail.pathInfo.responsePath === "/setup/domain" && evt.detail.successful) {
 						if (dev || await browserReachabilityTest()) {
@@ -14999,24 +15035,40 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domain, err := url.ParseRequestURI("https://" + domainParam)
-	if err != nil {
+	domainPattern := regexp.MustCompile(`^[a-z0-9]+(?:[\-.][a-z0-9]+)*\.[a-z]+$`)
+
+	if strings.Contains(domainParam, "/") {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`
 			<div id="alert" class="alert domain-alert" hx-swap-oob="true">
-				Domain is invalid
+				It looks like you've entered a URL, please enter a domain
 			</div>
 		`))
 		return
 	}
 
-	hostname := domain.Hostname()
-	if BUILD == "dev" || metaSSL == "false" {
-		hostname = domain.Host
+	if net.ParseIP(domainParam).String() != "<nil>" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="alert" class="alert domain-alert" hx-swap-oob="true">
+				It looks like you've entered an IP address, please enter a domain
+			</div>
+		`))
+		return
+	}
+
+	if !domainPattern.MatchString(domainParam) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`
+			<div id="alert" class="alert domain-alert" hx-swap-oob="true">
+				Invalid domain
+			</div>
+		`))
+		return
 	}
 
 	if BUILD == "release" && metaSSL == "true" {
-		found, err := lookupDomain(hostname)
+		found, err := lookupDomain(domainParam)
 		if err != nil {
 			log.Printf("postSetupDomain.lookupDomain: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -15059,7 +15111,7 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err = certmagic.ManageSync(r.Context(), []string{hostname})
+		err = certmagic.ManageSync(r.Context(), []string{domainParam})
 		if err != nil {
 			var acmeProblem acme.Problem
 			if errors.As(err, &acmeProblem) {
@@ -15109,7 +15161,7 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	err = updateMetaValue(tx, "domain", hostname)
+	err = updateMetaValue(tx, "domain", domainParam)
 	if err != nil {
 		log.Printf("postSetupDomain.updateMetaValueName: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -15130,7 +15182,7 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metaSetup = "account"
-	metaDomain = hostname
+	metaDomain = domainParam
 
 	if BUILD == "dev" || metaSSL == "false" {
 		w.Header().Add("HX-Location", "/setup/account")
