@@ -44,7 +44,7 @@ notification-channels:
     type: slack
     webhook-url: https://hooks.slack.com/services/...
 monitors:
-  get-monitor:
+  get:
     name: Example
     url: https://example.com
     method: GET
