@@ -17883,6 +17883,28 @@ func postConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
+	githubManagedConfigStr, err := getMetaValue(tx, "githubManagedConfig")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("postConfig.getMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubManagedConfig := false
+	if githubManagedConfigStr != "" {
+		githubManagedConfig, err = strconv.ParseBool(githubManagedConfigStr)
+		if err != nil {
+			log.Printf("postConfig.ParseBoolGitHubManagedConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if githubManagedConfig {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	msgs, err := applyConfig(tx, []byte(config))
 	if err != nil {
 		unwrappedErr := errors.Unwrap(err)
