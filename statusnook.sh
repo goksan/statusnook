@@ -32,7 +32,7 @@ case $(uname -p) in
         ;;
 esac
 
-curl -fsSL https://get.statusnook.com/statusnook_linux_${goarch}_v0.2.0 -o /home/statusnook/statusnook
+curl -fsSL https://get.statusnook.com/statusnook_linux_${goarch}_v0.3.0 -o /home/statusnook/statusnook
 
 chmod +x /home/statusnook/statusnook
 

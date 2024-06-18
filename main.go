@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -27,6 +30,7 @@ import (
 	"log"
 	"math/big"
 	mathRand "math/rand"
+	"mime"
 	"net"
 	"net/http"
 	"net/mail"
@@ -53,17 +57,66 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/mod/semver"
+	"gopkg.in/yaml.v3"
 )
 
 var BUILD = "dev"
 var CA = certmagic.LetsEncryptStagingCA
-var VERSION = "v0.2.0"
+var VERSION = "v0.3.0"
 
 //go:embed schema.sql
 var sqlSchema string
 
 const SELF_SIGNED_CERT_NAME = "self-signed-cert.pem"
 const SELF_SIGNED_KEY_NAME = "self-signed-key.pem"
+
+func Migration1715019045AddSlugColumns(tx *sql.Tx) error {
+	requiresSlug := map[string]string{
+		"old__service":              "service",
+		"old__monitor":              "monitor",
+		"old__notification_channel": "notification_channel",
+		"old__mail_group":           "mail_group",
+	}
+
+	for k, v := range requiresSlug {
+		err := copyNonSlugToSlugTable(tx, k, v)
+		if err != nil {
+			return fmt.Errorf("Migration1715019045AddSlugColumns.copyNonSlugToSlugTable"+k+": %w", err)
+		}
+	}
+
+	copy := map[string]string{
+		"old__alert_service":                   "alert_service",
+		"old__monitor_log":                     "monitor_log",
+		"old__monitor_log_last_checked":        "monitor_log_last_checked",
+		"old__monitor_notification_channel":    "monitor_notification_channel",
+		"old__alert_setting_smtp_notification": "alert_setting_smtp_notification",
+		"old__mail_group_member":               "mail_group_member",
+		"old__mail_group_monitor":              "mail_group_monitor",
+	}
+
+	for src, dst := range copy {
+		err := copyTable(tx, src, dst)
+		if err != nil {
+			return fmt.Errorf("Migration1715019045AddSlugColumns.copyTable"+src+": %w", err)
+		}
+	}
+
+	dropTablesQuery := ""
+	for k := range copy {
+		dropTablesQuery += "drop table " + k + "; "
+	}
+	for k := range requiresSlug {
+		dropTablesQuery += "drop table " + k + "; "
+	}
+
+	_, err := tx.Exec(dropTablesQuery)
+	if err != nil {
+		return fmt.Errorf("Migration1715019045AddSlugColumns.ExecDropTables: %w", err)
+	}
+
+	return nil
+}
 
 func initDB(immediate bool) *sql.DB {
 	if _, err := os.Stat("statusnook-data"); errors.Is(err, os.ErrNotExist) {
@@ -200,6 +253,13 @@ func initDB(immediate bool) *sql.DB {
 						log.Fatalf("initDB.ExecMigration %s: %s", file.Name(), err)
 					}
 
+					if file.Name() == "1715019045_add_slug_columns.sql" {
+						err = Migration1715019045AddSlugColumns(tx)
+						if err != nil {
+							log.Fatalf("initDB.Migration1715019045AddSlugColumns %s: %s", file.Name(), err)
+						}
+					}
+
 					insertMigrationQuery := fmt.Sprintf(
 						`insert into migration(name, skipped) values ('%s', false)`,
 						migrationName,
@@ -213,12 +273,214 @@ func initDB(immediate bool) *sql.DB {
 					if err != nil {
 						log.Fatalf("initDB.CommitMigration %s: %s", file.Name(), err)
 					}
+
+					if file.Name() == "1715019045_add_slug_columns.sql" {
+						_, err = db.Exec("vacuum")
+						if err != nil {
+							log.Printf("initDB.Migration1715019045AddSlugColumnsExecVacuum: %s", err)
+						}
+					}
 				}()
 			}
 		}
 	}
 
 	return db
+}
+
+func copyTable(tx *sql.Tx, src string, dst string) error {
+	cols := []string{}
+
+	rows, err := tx.Query("select name from pragma_table_info('" + src + "')")
+	if err != nil {
+		return fmt.Errorf("copyTable.Query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		col := ""
+
+		err := rows.Scan(&col)
+		if err != nil {
+			return fmt.Errorf("copyTable.Scan: %w", err)
+		}
+
+		cols = append(cols, col)
+	}
+
+	query := fmt.Sprintf(`
+		insert into
+			%s (
+				%s
+			)
+		select
+			%s
+		from
+			%s
+	`,
+		dst,
+		strings.Join(cols, ", "),
+		strings.Join(cols, ", "),
+		src,
+	)
+
+	_, err = tx.Exec(query)
+	if err != nil {
+		return fmt.Errorf("copyTable.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func copyNonSlugToSlugTable(tx *sql.Tx, src string, dst string) error {
+	srcCols := []string{}
+
+	rows, err := tx.Query("select name from pragma_table_info('" + src + "')")
+	if err != nil {
+		return fmt.Errorf("copyNonSlugToSlugTable.Query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		col := ""
+
+		err := rows.Scan(&col)
+		if err != nil {
+			return fmt.Errorf("copyNonSlugToSlugTable.ScanTableInfo: %w", err)
+		}
+
+		srcCols = append(srcCols, col)
+	}
+
+	dstCols := append(append([]string{}, "id", "slug"), srcCols[1:]...)
+
+	srcColsPlusSlug := append(
+		append([]string{}, "id", "(select slug from t where id = "+src+".id)"),
+		srcCols[1:]...,
+	)
+
+	var count int
+	err = tx.QueryRow(
+		`select count(*) from ` + src,
+	).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("copyNonSlugToSlugTable.ScanCount: %w", err)
+	}
+
+	if count == 0 {
+		return nil
+	}
+
+	cteQuery, params, err := generateSlugBackfillCte(tx, src)
+	if err != nil {
+		return fmt.Errorf("copyNonSlugToSlugTable.generateSlugBackfillCte: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		%s
+
+		insert into
+			%s (
+				%s
+			)
+		select
+			%s
+		from
+			%s;
+	`,
+		cteQuery,
+		dst,
+		strings.Join(dstCols, ", "),
+		strings.Join(srcColsPlusSlug, ", "),
+		src,
+	)
+
+	_, err = tx.Exec(query, params...)
+	if err != nil {
+		return fmt.Errorf("copyNonSlugToSlugTable.Exec: %w", err)
+	}
+
+	return nil
+}
+
+func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, []any, error) {
+	pattern := regexp.MustCompile(`[^\p{L}\d]+`)
+
+	query := "select id, name from " + tableName + " order by id asc"
+
+	rows, err := tx.Query(query)
+	if err != nil {
+		return "", []any{}, fmt.Errorf("generateSlugBackfillCte.Query: %w", err)
+	}
+	defer rows.Close()
+
+	idToName := map[int]string{}
+	slugToId := map[string]int{}
+	sortedIds := []int{}
+
+	for rows.Next() {
+		var id int
+		var name string
+
+		err := rows.Scan(&id, &name)
+		if err != nil {
+			return "", []any{}, fmt.Errorf("generateSlugBackfillCte.Scan: %w", err)
+		}
+
+		idToName[id] = name
+		sortedIds = append(sortedIds, id)
+	}
+
+	if len(idToName) == 0 {
+		return "", []any{}, nil
+	}
+
+	slices.Sort(sortedIds)
+
+	for _, id := range sortedIds {
+		attempt := 0
+		for {
+			slug := strings.Trim(pattern.ReplaceAllString(strings.ToLower(idToName[id]), "-"), "-")
+
+			if slug == "" {
+				slug = strconv.Itoa(attempt)
+			} else if attempt > 0 {
+				slug += "-" + strconv.Itoa(attempt)
+			}
+
+			attempt++
+
+			_, ok := slugToId[slug]
+			if !ok {
+				slugToId[slug] = id
+				break
+			}
+		}
+	}
+
+	if len(slugToId) == 0 {
+		return "", []any{}, nil
+	}
+
+	updateQuery := `
+		with t(slug, id) as(values
+	`
+
+	params := []any{}
+
+	i := 0
+	for slug, id := range slugToId {
+		updateQuery += "(?, ?)"
+		params = append(params, slug, id)
+		if i < len(slugToId)-1 {
+			updateQuery += ","
+		}
+		i++
+	}
+
+	updateQuery += ")"
+
+	return updateQuery, params, nil
 }
 
 var tmpls = map[string]*template.Template{}
@@ -234,7 +496,7 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 			<head>
 				<title>{{template "title" .}}</title>
 				<link rel="stylesheet" href="/static/main.css">
-				<script type="text/javascript" src="/static/htmx.js"></script>
+				<script type="text/javascript" src="/static/htmx-1.9.12.js"></script>
 				<meta name="viewport" content="width=device-width, initial-scale=1" />
 			</head>
 			<body hx-history="false">
@@ -568,7 +830,10 @@ var metaName string
 var metaDomain string
 var metaUnconfirmedDomain string
 var metaUnconfirmedDomainProblem string
+
 var metaSSL string
+
+var metaConfigFileEnabled bool
 
 type statusCtxKey struct{}
 
@@ -586,6 +851,7 @@ type pageCtx struct {
 	HideUnconfirmedDomain    bool
 	ShouldAttemptRedirect    bool
 	Domain                   string
+	ConfigFile               bool
 }
 
 func getPageCtx(r *http.Request) pageCtx {
@@ -619,7 +885,8 @@ func getPageCtx(r *http.Request) pageCtx {
 		HideUnconfirmedDomain:    r.URL.Path == "/admin/settings",
 		ShouldAttemptRedirect: metaSSL == "true" && authCtx.ID != 0 &&
 			metaDomain != "" && parsedURL.Hostname() != metaDomain,
-		Domain: metaDomain,
+		Domain:     metaDomain,
+		ConfigFile: metaConfigFileEnabled,
 	}
 }
 
@@ -1790,10 +2057,31 @@ func getMetaValue(tx *sql.Tx, name string) (string, error) {
 }
 
 func neuter(next http.Handler) http.Handler {
+	gzAvailable := map[string]string{}
+	err := fs.WalkDir(staticFS, "static", func(path string, d fs.DirEntry, err error) error {
+		if !d.IsDir() {
+			if strings.HasSuffix(d.Name(), ".gz") {
+				gzAvailable[strings.Replace(path, ".gz", "", 1)] = path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("neuter.WalkDir: %s", err)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/") {
 			http.NotFound(w, r)
 			return
+		}
+
+		if gzPath, ok := gzAvailable[strings.TrimPrefix(r.URL.Path, "/")]; ok {
+			r.URL.Path = gzPath
+			split := strings.Split(r.URL.Path, ".")
+			ext := split[len(split)-2]
+			w.Header().Add("Content-Type", mime.TypeByExtension("."+ext))
+			w.Header().Add("Content-Encoding", "gzip")
 		}
 
 		next.ServeHTTP(w, r)
@@ -2018,6 +2306,1216 @@ func GenerateSelfSignedCertificate() {
 
 var dockerFlag = flag.Bool("docker", false, "")
 
+type StatusnookConfigSlackNotificationChannel struct {
+	WebhookURL string `json:"webhookURL" yaml:"webhook-url"`
+}
+
+type StatusnookConfigSMTPNotificationChannel struct {
+	Host     string            `json:"host" yaml:"host"`
+	Port     int               `json:"port" yaml:"port"`
+	Username string            `json:"username" yaml:"username"`
+	Password string            `json:"password" yaml:"password"`
+	From     string            `json:"from" yaml:"from"`
+	Headers  map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Misc     map[string]string `json:"misc,omitempty" yaml:"misc,omitempty"`
+}
+
+type StatusnookConfigMonitor struct {
+	Name                 string            `json:"name" yaml:"name"`
+	URL                  string            `json:"url" yaml:"url"`
+	Method               string            `json:"method" yaml:"method"`
+	Frequency            int               `json:"frequency" yaml:"frequency"`
+	Timeout              int               `json:"timeout" yaml:"timeout"`
+	Attempts             int               `json:"attempts" yaml:"attempts"`
+	RequestHeaders       map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	RequestBody          any               `json:"body,omitempty" yaml:"body,omitempty"`
+	NotificationChannels []string          `json:"notification-channels,omitempty" yaml:"notification-channels,omitempty"`
+	MailGroups           []string          `json:"mail-groups,omitempty" yaml:"mail-groups,omitempty"`
+}
+
+type StatusnookConfigGeneralSettings struct {
+	Name string `json:"name" yaml:"name"`
+}
+
+type StatusnookConfigService struct {
+	Name        string `json:"name" yaml:"name"`
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
+}
+
+type StatusnookConfigAlertNotificationSettings struct {
+	EmailNotificationChannel string `json:"email-notification-channel,omitempty" yaml:"email-notification-channel,omitempty"`
+	ManagedSubscriptions     bool   `json:"managed-subscriptions,omitempty" yaml:"managed-subscriptions,omitempty"`
+	SlackClientSecret        string `json:"slack-client-secret,omitempty" yaml:"slack-client-secret,omitempty"`
+	SlackInstallURL          string `json:"slack-install-url,omitempty" yaml:"slack-install-url,omitempty"`
+}
+
+type StatusnookConfigMailGroup struct {
+	Name        string   `json:"name" yaml:"name"`
+	Members     []string `json:"members,omitempty" yaml:"members,omitempty"`
+	Description string   `json:"description,omitempty" yaml:"description,omitempty"`
+}
+
+type StatusnookConfig struct {
+	GeneralSettings           StatusnookConfigGeneralSettings           `json:"general-settings" yaml:"general-settings"`
+	MailGroups                map[string]StatusnookConfigMailGroup      `json:"mail-groups,omitempty" yaml:"mail-groups,omitempty"`
+	NotificationChannels      map[string]map[string]any                 `json:"notification-channels,omitempty" yaml:"notification-channels,omitempty"`
+	Monitors                  map[string]StatusnookConfigMonitor        `json:"monitors,omitempty" yaml:"monitors,omitempty"`
+	Services                  map[string]StatusnookConfigService        `json:"services,omitempty" yaml:"services,omitempty"`
+	AlertNotificationSettings StatusnookConfigAlertNotificationSettings `json:"alert-notification-settings,omitempty" yaml:"alert-notification-settings,omitempty"`
+	Rename                    map[string]string                         `json:"rename,omitempty" yaml:"rename,omitempty"`
+}
+
+func applyConfig(tx *sql.Tx, cfgBytes []byte) ([]string, error) {
+	msgs := []string{}
+
+	decryptedCfg := string(cfgBytes)
+
+	key, err := getMetaValue(tx, "secretKey")
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.getMetaValue: %w", err)
+	}
+
+	keyBytes, err := base64.StdEncoding.DecodeString(key)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.DecodeStringKey: %w", err)
+	}
+
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.NewCipher: %w", err)
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.NewGCM: %w", err)
+	}
+
+	slugPattern := regexp.MustCompile(`^-+|[^\p{Ll}\d-]+|-+$`)
+
+	secretPattern := regexp.MustCompile(`\bsecret_[A-Za-z0-9+\/=.]+`)
+	secretMatches := secretPattern.FindAllString(string(cfgBytes), -1)
+
+	for _, v := range secretMatches {
+		nonceSplit := strings.Split(v, ".")
+		if len(nonceSplit) != 2 {
+			continue
+		}
+
+		ciphertext, err := base64.StdEncoding.DecodeString(
+			strings.TrimPrefix(nonceSplit[0], "secret_"),
+		)
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.DecodeStringCiphertext: %w", err)
+		}
+
+		nonce, err := base64.StdEncoding.DecodeString(nonceSplit[1])
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.DecodeStringNonce: %w", err)
+		}
+
+		plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			continue
+		}
+
+		decryptedCfg = strings.ReplaceAll(decryptedCfg, v, string(plaintext))
+	}
+
+	cfg := StatusnookConfig{}
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(decryptedCfg)))
+	decoder.KnownFields(true)
+	err = decoder.Decode(&cfg)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.Decode: %w", err)
+	}
+
+	renameSrcMsg := func(k string) {
+		msgs = append(msgs, "rename: '"+k+
+			"' does not exist, drop this rename if you've already completed it")
+	}
+
+	renameDstMsg := func(entityType string, src string, dst string) {
+		msgs = append(msgs, "rename: replace "+entityType+" '"+src+"' with "+" '"+dst+
+			"' to perform a rename")
+	}
+
+	invalidSlugMsg := func(entityType string, slug string) {
+		msgs = append(msgs, entityType+"."+slug+
+			": must only contain lower-case letters, numbers, and hyphens")
+	}
+
+	duplicateSlugMsg := func(entityType string, slug string) {
+		msgs = append(msgs, "rename: "+entityType+"."+slug+
+			" would not be unique")
+	}
+
+	for k, v := range cfg.Rename {
+		validSrc := true
+		validRename := true
+
+		split := strings.Split(k, ".")
+		if len(split) != 2 {
+			validRename = false
+			msgs = append(msgs, "rename: '"+k+"'"+
+				" invalid")
+			continue
+		}
+
+		entityType := split[0]
+		src := split[1]
+
+		if src == v {
+			validRename = false
+			msgs = append(msgs, "rename: service "+" '"+src+"' to "+" '"+v+
+				"' is invalid")
+		}
+
+		if slugPattern.MatchString(v) {
+			validRename = false
+			msgs = append(msgs, "rename: '"+v+"'"+
+				" must only contain lower-case letters, numbers, and hyphens")
+		}
+
+		if entityType == "services" {
+			_, err := updateServiceSlug(tx, src, v)
+			if err != nil {
+				var sqliteErr sqlite3.Error
+
+				if errors.Is(err, sql.ErrNoRows) {
+					validSrc = false
+					if validRename {
+						renameSrcMsg(k)
+					}
+				} else if errors.As(err, &sqliteErr) {
+					if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+						duplicateSlugMsg("services", v)
+					}
+				} else {
+					return msgs, fmt.Errorf("applyConfig.updateServiceSlug: %w", err)
+				}
+			}
+
+			if validSrc && validRename {
+				if _, ok := cfg.Services[v]; !ok {
+					renameDstMsg("service", src, v)
+				}
+			}
+		} else if entityType == "notification-channels" {
+			_, err := updateNotificationChannelSlug(tx, src, v)
+			if err != nil {
+				var sqliteErr sqlite3.Error
+
+				if errors.Is(err, sql.ErrNoRows) {
+					validSrc = false
+					if validRename {
+						renameSrcMsg(k)
+					}
+				} else if errors.As(err, &sqliteErr) {
+					if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+						duplicateSlugMsg("services", v)
+					}
+				} else {
+					return msgs, fmt.Errorf("applyConfig.updateNotificationChannelSlug: %w", err)
+				}
+			}
+
+			if validSrc && validRename {
+				if _, ok := cfg.NotificationChannels[v]; !ok {
+					renameDstMsg("notification channel", src, v)
+				}
+			}
+		} else if entityType == "mail-groups" {
+			_, err := updateMailGroupSlug(tx, src, v)
+			if err != nil {
+				var sqliteErr sqlite3.Error
+
+				if errors.Is(err, sql.ErrNoRows) {
+					validSrc = false
+					if validRename {
+						renameSrcMsg(k)
+					}
+				} else if errors.As(err, &sqliteErr) {
+					if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+						duplicateSlugMsg("services", v)
+					}
+				} else {
+					return msgs, fmt.Errorf("applyConfig.updateMailGrouplug: %w", err)
+				}
+			}
+
+			if validSrc && validRename {
+				if _, ok := cfg.MailGroups[v]; !ok {
+					renameDstMsg("mail group", src, v)
+				}
+			}
+		} else if entityType == "monitors" {
+			_, err := updateMonitorSlug(tx, src, v)
+			if err != nil {
+				var sqliteErr sqlite3.Error
+
+				if errors.Is(err, sql.ErrNoRows) {
+					validSrc = false
+					if validRename {
+						renameSrcMsg(k)
+					}
+				} else if errors.As(err, &sqliteErr) {
+					if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
+						duplicateSlugMsg("services", v)
+					}
+				} else {
+					return msgs, fmt.Errorf("applyConfig.updateMonitorSlug: %w", err)
+				}
+			}
+
+			if validSrc && validRename {
+				if _, ok := cfg.Monitors[v]; !ok {
+					renameDstMsg("monitor", src, v)
+				}
+			}
+		} else {
+			msgs = append(msgs, "rename: '"+k+"' is invalid")
+		}
+	}
+
+	if cfg.GeneralSettings.Name != "" {
+		err = updateMetaValue(tx, "name", cfg.GeneralSettings.Name)
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.updateMetaValueGeneralSettingsName: %w", err)
+		}
+	} else {
+		msgs = append(msgs, "general-settings.name"+": is required")
+	}
+
+	existingServiceSlugs := map[string]int{}
+
+	services, err := listServices(tx)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listServices: %w", err)
+	}
+
+	for _, v := range services {
+		if _, ok := cfg.Services[v.Slug]; !ok {
+			err := deleteServiceByID(tx, v.ID)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.deleteServiceByID: %w", err)
+			}
+			continue
+		}
+
+		existingServiceSlugs[v.Slug] = v.ID
+	}
+
+	processedServices := map[string]bool{}
+
+	for slug, v := range cfg.Services {
+		processedServices[slug] = true
+
+		if slug == "" || slugPattern.MatchString(slug) {
+			invalidSlugMsg("services", slug)
+			continue
+		}
+
+		if v.Name == "" {
+			msgs = append(msgs, "services."+slug+": name is required")
+		}
+
+		if _, ok := existingServiceSlugs[slug]; ok {
+			err = editService(tx, existingServiceSlugs[slug], v.Name, v.Description)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.editService: %w", err)
+			}
+		} else {
+			err = createService(tx, slug, v.Name, v.Description)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.createService: %w", err)
+			}
+		}
+	}
+
+	existingMonitorSlugs := map[string]int{}
+
+	monitors, err := listMonitors(tx)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listMailGroups: %w", err)
+	}
+
+	for _, v := range monitors {
+		existingMonitorSlugs[v.Slug] = v.ID
+	}
+
+	for slug, v := range cfg.Monitors {
+		if slug == "" || slugPattern.MatchString(slug) {
+			invalidSlugMsg("monitors", slug)
+			continue
+		}
+
+		if v.Name == "" {
+			msgs = append(msgs, "monitors."+slug+": name is required")
+		}
+
+		if v.URL == "" {
+			msgs = append(msgs, "monitors."+slug+": url is required")
+		}
+
+		reqURL := v.URL
+		validURL := true
+		parsedReqURL, err := url.Parse(reqURL)
+		if err != nil {
+			validURL = false
+		} else if parsedReqURL.Scheme == "" || parsedReqURL.Host == "" {
+			validURL = false
+		} else if parsedReqURL.Scheme != "http" && parsedReqURL.Scheme != "https" {
+			validURL = false
+		}
+		if !validURL {
+			msgs = append(msgs, "monitors."+slug+": url is invalid")
+		}
+
+		if !(strings.EqualFold(v.Method, "get") || strings.EqualFold(v.Method, "post") ||
+			strings.EqualFold(v.Method, "patch") || strings.EqualFold(v.Method, "put") ||
+			strings.EqualFold(v.Method, "delete")) {
+			msgs = append(
+				msgs,
+				"monitors."+slug+": method must be one of get, post, patch, put, delete",
+			)
+		}
+
+		if v.Frequency != 10 && v.Frequency != 30 && v.Frequency != 60 {
+			msgs = append(msgs, "monitors."+slug+": frequency must be one of 10, 30, 60")
+		}
+
+		if v.Timeout != 5 && v.Timeout != 10 && v.Timeout != 15 {
+			msgs = append(msgs, "monitors."+slug+": timeout must be one of 5, 10, 15")
+		}
+
+		if v.Attempts != 1 && v.Attempts != 2 && v.Attempts != 3 {
+			msgs = append(msgs, "monitors."+slug+": attempts must be one of 1, 2, 3")
+		}
+
+		requestHeadersStr, err := json.Marshal(v.RequestHeaders)
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.MarshalRequestHeaders: %w", err)
+		}
+
+		requestBodyNullStr := sql.NullString{Valid: false}
+		bodyFormat := sql.NullString{Valid: false}
+
+		if v.RequestBody != nil {
+			if _, ok := v.RequestBody.(map[string]any); ok {
+				vMap := v.RequestBody.(map[string]any)
+
+				values := url.Values{}
+				for k, v := range vMap {
+					str := ""
+					if vs, ok := v.(int); ok {
+						str = strconv.Itoa(vs)
+					}
+					if vs, ok := v.(string); ok {
+						str = vs
+					}
+					values.Add(k, str)
+				}
+
+				bodyFormat = sql.NullString{Valid: true, String: "form"}
+				requestBodyNullStr = sql.NullString{Valid: true, String: values.Encode()}
+			} else if _, ok := v.RequestBody.(string); ok {
+				bodyFormat = sql.NullString{Valid: true, String: "text"}
+				requestBodyNullStr = sql.NullString{Valid: true, String: v.RequestBody.(string)}
+			} else {
+				msgs = append(msgs, "monitors."+slug+": body is invalid")
+			}
+		}
+
+		if _, ok := existingMonitorSlugs[slug]; ok {
+			_, err := editMonitor(
+				tx,
+				existingMonitorSlugs[slug],
+				v.Name,
+				v.URL,
+				strings.ToUpper(v.Method),
+				v.Frequency,
+				v.Timeout,
+				v.Attempts,
+				sql.NullString{Valid: true, String: string(requestHeadersStr)},
+				bodyFormat,
+				requestBodyNullStr,
+			)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.editMonitor: %w", err)
+			}
+		} else {
+			_, err := createMonitor(
+				tx,
+				slug,
+				v.Name,
+				v.URL,
+				strings.ToUpper(v.Method),
+				v.Frequency,
+				v.Timeout,
+				v.Attempts,
+				sql.NullString{Valid: true, String: string(requestHeadersStr)},
+				bodyFormat,
+				requestBodyNullStr,
+			)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.createMonitor: %w", err)
+			}
+		}
+	}
+
+	existingNotificationChannelSlugs := map[string]int{}
+
+	notificationChannels, err := listNotificationChannels(tx, listNotificationsOptions{})
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listNotificationChannels: %w", err)
+	}
+
+	for _, v := range notificationChannels {
+		if _, ok := cfg.NotificationChannels[v.Slug]; !ok {
+			err := deleteNotificationChannelByID(tx, v.ID)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.deleteNotificationChannelByID: %w", err)
+			}
+			continue
+		}
+
+		existingNotificationChannelSlugs[v.Slug] = v.ID
+	}
+
+	for slug, v := range cfg.NotificationChannels {
+		if slug == "" || slugPattern.MatchString(slug) {
+			invalidSlugMsg("notification-channels", slug)
+			continue
+		}
+
+		details := "{}"
+
+		type baseNotificationChannel struct {
+			Name string
+			Type string
+		}
+
+		typeAny, ok := v["type"]
+		if !ok {
+			msgs = append(msgs, "notification-channels."+slug+": type is required")
+		}
+
+		cType, ok := typeAny.(string)
+		if !ok {
+			msgs = append(msgs, "notification-channels."+slug+": type is invalid")
+		} else if cType == "" {
+			msgs = append(msgs, "notification-channels."+slug+": type is required")
+		}
+
+		if cType != "smtp" && cType != "slack" {
+			msgs = append(msgs, "notification-channels."+slug+": type must be one of smtp, slack")
+		}
+
+		nameAny, ok := v["name"]
+		if !ok {
+			msgs = append(msgs, "notification-channels."+slug+": name is required")
+		}
+
+		name, ok := nameAny.(string)
+		if !ok {
+			msgs = append(msgs, "notification-channels."+slug+": name is invalid")
+		} else if name == "" {
+			msgs = append(msgs, "notification-channels."+slug+": name is required")
+		}
+
+		channel := baseNotificationChannel{
+			Type: cType,
+			Name: name,
+		}
+
+		if channel.Type == "slack" {
+			unknownProps := []string{}
+
+			requiredProps := map[string]bool{
+				"type":        true,
+				"name":        true,
+				"webhook-url": true,
+			}
+
+			for k := range v {
+				if _, ok := requiredProps[k]; !ok {
+					unknownProps = append(unknownProps, k)
+				}
+			}
+
+			for _, prop := range unknownProps {
+				msgs = append(
+					msgs,
+					"notification-channels."+slug+": "+prop+
+						" is an invalid property for a slack notification channel",
+				)
+			}
+
+			webhookURLAny, ok := v["webhook-url"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is required")
+			}
+
+			webhookURL, ok := webhookURLAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is invalid")
+			} else if webhookURL == "" {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is required")
+			}
+
+			validURL := true
+			parsedReqURL, err := url.Parse(webhookURL)
+			if err != nil {
+				validURL = false
+			} else if parsedReqURL.Scheme == "" || parsedReqURL.Host == "" {
+				validURL = false
+			} else if parsedReqURL.Scheme != "http" && parsedReqURL.Scheme != "https" {
+				validURL = false
+			}
+
+			if !validURL {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is invalid")
+			}
+
+			d := StatusnookConfigSlackNotificationChannel{WebhookURL: webhookURL}
+			detailBytes, err := json.Marshal(d)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.MarshalSlackNotificationDetails: %w", err)
+			}
+
+			details = string(detailBytes)
+		} else if channel.Type == "smtp" {
+			unknownProps := []string{}
+
+			requiredProps := map[string]bool{
+				"type":     true,
+				"name":     true,
+				"headers":  true,
+				"host":     true,
+				"port":     true,
+				"username": true,
+				"password": true,
+				"from":     true,
+				"misc":     true,
+			}
+
+			for k := range v {
+				if _, ok := requiredProps[k]; !ok {
+					unknownProps = append(unknownProps, k)
+				}
+			}
+
+			for _, prop := range unknownProps {
+				msgs = append(
+					msgs,
+					"notification-channels."+slug+": "+prop+
+						" is an unknown property for an SMTP notification channel",
+				)
+			}
+
+			hostAny, ok := v["host"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": host is required")
+			}
+
+			host, ok := hostAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": host is invalid")
+			} else if host == "" {
+				msgs = append(msgs, "notification-channels."+slug+": host is required")
+			}
+
+			portAny, ok := v["port"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": port is required")
+			}
+
+			port, ok := portAny.(int)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": port is invalid")
+			} else if port == 0 {
+				msgs = append(msgs, "notification-channels."+slug+": port is required")
+			}
+
+			usernameAny, ok := v["username"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": username is required")
+			}
+
+			username, ok := usernameAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": username is invalid")
+			} else if username == "" {
+				msgs = append(msgs, "notification-channels."+slug+": username is required")
+			}
+
+			passwordAny, ok := v["password"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": password is required")
+			}
+
+			password, ok := passwordAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": password is invalid")
+			} else if password == "" {
+				msgs = append(msgs, "notification-channels."+slug+": password is required")
+			}
+
+			fromAny, ok := v["from"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": from is required")
+			}
+
+			from, ok := fromAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": from is invalid")
+			} else if from == "" {
+				msgs = append(msgs, "notification-channels."+slug+": from is required")
+			}
+			if _, err := mail.ParseAddress(from); err != nil {
+				msgs = append(msgs, "notification-channels."+slug+": from is an invalid email address")
+			}
+
+			headers := map[string]string{}
+
+			headersAny, ok := v["headers"]
+			if ok {
+				headersMapAny, ok := headersAny.(map[string]any)
+				if !ok {
+					msgs = append(msgs, "notification-channels."+slug+": headers is invalid")
+				}
+
+				for k, v := range headersMapAny {
+					if vs, ok := v.(string); ok {
+						headers[k] = vs
+						continue
+					}
+					if vs, ok := v.(int); ok {
+						headers[k] = strconv.Itoa(vs)
+						continue
+					}
+					msgs = append(
+						msgs,
+						"notification-channels."+slug+": invalid header value "+k+
+							", must be string or number",
+					)
+				}
+			}
+
+			misc := map[string]string{}
+
+			miscAny, ok := v["misc"]
+			if ok {
+				miscMapAny, ok := miscAny.(map[string]any)
+				if !ok {
+					msgs = append(msgs, "notification-channels."+slug+": misc is invalid")
+				}
+
+				for k, v := range miscMapAny {
+					if vs, ok := v.(string); ok {
+						misc[k] = vs
+						continue
+					}
+					if vs, ok := v.(int); ok {
+						misc[k] = strconv.Itoa(vs)
+						continue
+					}
+					msgs = append(
+						msgs,
+						"notification-channels."+slug+": invalid misc value "+k+
+							", must be string or number",
+					)
+				}
+			}
+
+			d := StatusnookConfigSMTPNotificationChannel{
+				Host:     host,
+				Port:     port,
+				Username: username,
+				Password: password,
+				From:     from,
+				Headers:  headers,
+				Misc:     misc,
+			}
+			detailBytes, err := json.Marshal(d)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.MarshalSlackNotificationDetails: %w", err)
+			}
+
+			details = string(detailBytes)
+		}
+
+		if _, ok := existingNotificationChannelSlugs[slug]; ok {
+			err := editNotificationChannel(
+				tx,
+				NotificationChannel{
+					ID:      existingNotificationChannelSlugs[slug],
+					Name:    channel.Name,
+					Type:    channel.Type,
+					Details: details,
+				},
+			)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.editNotificationChannel: %w", err)
+			}
+		} else {
+			err := createNotification(tx, slug, channel.Name, channel.Type, details)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.createNotification: %w", err)
+			}
+		}
+	}
+
+	existingMailGroupSlugs := map[string]int{}
+
+	mailGroups, err := listMailGroups(tx)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listMailGroups2: %w", err)
+	}
+
+	for _, v := range mailGroups {
+		if _, ok := cfg.MailGroups[v.Slug]; !ok {
+			err := deleteMailGroupByID(tx, v.ID)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.deleteMailGroupByID: %w", err)
+			}
+			continue
+		}
+		existingMailGroupSlugs[v.Slug] = v.ID
+	}
+
+	for slug, v := range cfg.MailGroups {
+		if slug == "" || slugPattern.MatchString(slug) {
+			invalidSlugMsg("mail-groups", slug)
+			continue
+		}
+
+		if v.Name == "" {
+			msgs = append(msgs, "mail-groups."+slug+": name is required")
+		}
+
+		uniqueMembers := map[string]bool{}
+
+		for _, v := range v.Members {
+			email, err := mail.ParseAddress(v)
+			if err != nil {
+				msgs = append(msgs, "mail-groups."+slug+": email is invalid \""+v+"\"")
+				continue
+			}
+
+			if _, ok := uniqueMembers[strings.ToLower(email.String())]; ok {
+				msgs = append(msgs, "mail-groups."+slug+": member is duplicated \""+v+"\"")
+			}
+
+			uniqueMembers[strings.ToLower(email.String())] = true
+		}
+
+		if _, ok := existingMailGroupSlugs[slug]; ok {
+			err := updateMailGroup(tx, existingMailGroupSlugs[slug], v.Name, v.Description)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.updateMailGroup: %w", err)
+			}
+			err = updateMailGroupMembers(tx, existingMailGroupSlugs[slug], v.Members)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.updateMailGroupMembersUpdate: %w", err)
+			}
+		} else {
+			id, err := createMailGroup(tx, slug, v.Name, v.Description)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.createMailGroup: %w", err)
+			}
+
+			err = updateMailGroupMembers(tx, id, v.Members)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.updateMailGroupMembersCreate: %w", err)
+			}
+		}
+	}
+
+	monitors, err = listMonitors(tx)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listMonitors2: %w", err)
+	}
+
+	channels, err := listNotificationChannels(tx, listNotificationsOptions{})
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listNotificationChannels2: %w", err)
+	}
+
+	channelSlugs := map[string]int{}
+	for _, v := range channels {
+		channelSlugs[v.Slug] = v.ID
+	}
+
+	mailGroups, err = listMailGroups(tx)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.listMailGroups3: %w", err)
+	}
+
+	mailGroupSlugs := map[string]int{}
+	for _, v := range mailGroups {
+		mailGroupSlugs[v.Slug] = v.ID
+	}
+
+	for _, v := range monitors {
+		if _, ok := cfg.Monitors[v.Slug]; !ok {
+			err := deleteMonitorByID(tx, v.ID)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.deleteMonitorByID: %w", err)
+			}
+			continue
+		}
+
+		existingMonitorSlugs[v.Slug] = v.ID
+	}
+
+	for slug, monitor := range cfg.Monitors {
+		if slug == "" || slugPattern.MatchString(slug) {
+			invalidSlugMsg("monitors", slug)
+			continue
+		}
+
+		skipUpdate := false
+
+		channelIDs := []int{}
+		uniqueNotificationChannels := map[string]bool{}
+		for _, channelSlug := range monitor.NotificationChannels {
+			if _, ok := channelSlugs[channelSlug]; !ok {
+				msgs = append(
+					msgs,
+					"monitors."+slug+
+						": notification-channels contains unknown channel \""+channelSlug+"\"",
+				)
+				skipUpdate = true
+				continue
+			}
+
+			if _, ok := uniqueNotificationChannels[channelSlug]; ok {
+				msgs = append(
+					msgs,
+					"monitors."+slug+
+						": notification channel is duplicated \""+channelSlug+"\"",
+				)
+				skipUpdate = true
+				continue
+			}
+
+			uniqueNotificationChannels[channelSlug] = true
+			channelIDs = append(channelIDs, channelSlugs[channelSlug])
+		}
+
+		mailGroupIDs := []int{}
+		uniqueMailGroups := map[string]bool{}
+		for _, groupSlug := range monitor.MailGroups {
+			if _, ok := mailGroupSlugs[groupSlug]; !ok {
+				msgs = append(
+					msgs,
+					"monitors."+slug+
+						": mail-groups contains unknown mail group \""+groupSlug+"\"",
+				)
+				skipUpdate = true
+				continue
+			}
+
+			if _, ok := uniqueMailGroups[groupSlug]; ok {
+				msgs = append(
+					msgs,
+					"monitors."+slug+
+						": mail group is duplicated \""+groupSlug+"\"",
+				)
+				skipUpdate = true
+				continue
+			}
+
+			uniqueMailGroups[groupSlug] = true
+			mailGroupIDs = append(mailGroupIDs, mailGroupSlugs[groupSlug])
+		}
+
+		if skipUpdate {
+			continue
+		}
+
+		err = updateMonitorNotificationChannels(
+			tx,
+			existingMonitorSlugs[slug],
+			channelIDs,
+		)
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.updateMonitorNotificationChannels: %w", err)
+		}
+
+		err = updateMonitorMailGroups(
+			tx,
+			existingMonitorSlugs[slug],
+			mailGroupIDs,
+		)
+		if err != nil {
+			return msgs, fmt.Errorf("applyConfig.updateMonitorMailGroups: %w", err)
+		}
+	}
+
+	managedSubscriptions := cfg.AlertNotificationSettings.ManagedSubscriptions
+
+	err = updateAlertSettings(
+		tx,
+		cfg.AlertNotificationSettings.SlackInstallURL,
+		cfg.AlertNotificationSettings.SlackClientSecret,
+		managedSubscriptions,
+	)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.updateAlertSettings: %w", err)
+	}
+
+	if cfg.AlertNotificationSettings.EmailNotificationChannel != "" {
+		if _, ok := channelSlugs[cfg.AlertNotificationSettings.EmailNotificationChannel]; !ok {
+			msgs = append(
+				msgs,
+				"alert-notification-settings.email-notification-channel: "+
+					"refers to unknown channel \""+
+					cfg.AlertNotificationSettings.EmailNotificationChannel+"\"",
+			)
+		}
+	}
+
+	channel, err := getNotificationChannelBySlug(
+		tx,
+		cfg.AlertNotificationSettings.EmailNotificationChannel,
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return msgs, fmt.Errorf("applyConfig.getNotificationChannelBySlug: %w", err)
+	}
+
+	err = updateAlertSMTPNotificationSetting(tx, channel.ID)
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.updateAlertSMTPNotificationSetting: %w", err)
+	}
+
+	uniqueMessages := map[string]bool{}
+
+	finalMsgs := []string{}
+	for _, v := range msgs {
+		if _, ok := uniqueMessages[v]; ok {
+			continue
+		}
+		uniqueMessages[v] = true
+		finalMsgs = append(finalMsgs, v)
+	}
+
+	err = updateMetaValue(tx, "configFile", string(cfgBytes))
+	if err != nil {
+		return msgs, fmt.Errorf("applyConfig.updateMetaValueConfigFile: %w", err)
+	}
+
+	return finalMsgs, nil
+}
+
+func generateSlug(name string, slugs map[string]bool) string {
+	pattern := regexp.MustCompile(`[^\p{L}\d]+`)
+
+	attempt := 0
+	for {
+		slug := strings.Trim(pattern.ReplaceAllString(strings.ToLower(name), "-"), "-")
+
+		if slug == "" {
+			slug = strconv.Itoa(attempt)
+		} else if attempt > 0 {
+			slug += "-" + strconv.Itoa(attempt)
+		}
+
+		attempt++
+
+		_, ok := slugs[slug]
+		if !ok {
+			return slug
+		}
+	}
+}
+
+func generateConfig(tx *sql.Tx) (string, error) {
+	cfgStr := ""
+
+	mailGroups, err := listMailGroups(tx)
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.listMailGroups: %w", err)
+	}
+
+	mailGroupMembers := map[int][]string{}
+
+	for _, v := range mailGroups {
+		members, err := listMailGroupMembersByID(tx, v.ID)
+		if err != nil {
+			return cfgStr, fmt.Errorf("generateConfig.listMailGroupMembersByID: %w", err)
+		}
+		for _, m := range members {
+			mailGroupMembers[v.ID] = append(mailGroupMembers[v.ID], m.EmailAddress)
+		}
+	}
+
+	cfgMailGroups := map[string]StatusnookConfigMailGroup{}
+	for _, v := range mailGroups {
+		cfgMailGroups[v.Slug] = StatusnookConfigMailGroup{
+			Name:        v.Name,
+			Members:     mailGroupMembers[v.ID],
+			Description: v.Description,
+		}
+	}
+
+	notificationChannels, err := listNotificationChannels(tx, listNotificationsOptions{})
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.listNotificationChannels: %w", err)
+	}
+
+	cfgNotificationChannels := map[string]map[string]any{}
+	for _, v := range notificationChannels {
+		if v.Type == "smtp" {
+			details, ok := v.Details.(SMTPNotificationDetails)
+			if !ok {
+				return cfgStr, fmt.Errorf("generateConfig.AssertSMTPNotificationDetails")
+			}
+
+			cfgNotificationChannel := map[string]any{
+				"type":     v.Type,
+				"name":     v.Name,
+				"host":     details.Host,
+				"port":     details.Port,
+				"username": details.Username,
+				"password": details.Password,
+				"from":     details.From,
+			}
+			if len(details.Headers) > 0 {
+				cfgNotificationChannel["headers"] = details.Headers
+			}
+			if len(details.Misc) > 0 {
+				cfgNotificationChannel["misc"] = details.Misc
+			}
+
+			cfgNotificationChannels[v.Slug] = cfgNotificationChannel
+		} else if v.Type == "slack" {
+			details, ok := v.Details.(SlackNotificationDetails)
+			if !ok {
+				return cfgStr, fmt.Errorf("generateConfig.AssertSlackNotificationDetails")
+			}
+
+			cfgNotificationChannels[v.Slug] = map[string]any{
+				"type":        v.Type,
+				"name":        v.Name,
+				"webhook-url": details.WebhookURL,
+			}
+		}
+	}
+
+	monitors, err := listMonitors(tx)
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.listMonitors: %w", err)
+	}
+
+	cfgMonitors := map[string]StatusnookConfigMonitor{}
+	for _, v := range monitors {
+		channels, err := listNotificationChannelsByMonitorID(tx, v.ID)
+		if err != nil {
+			return cfgStr, fmt.Errorf("generateConfig.listNotificationChannelsByMonitorID: %w", err)
+		}
+
+		cfgNotificationChannels := []string{}
+		for _, c := range channels {
+			cfgNotificationChannels = append(cfgNotificationChannels, c.Slug)
+		}
+
+		mailGroups, err := listMailGroupIDsByMonitorID(tx, v.ID)
+		if err != nil {
+			return cfgStr, fmt.Errorf("generateConfig.listMailGroupIDsByMonitorID: %w", err)
+		}
+
+		cfgMailGroups := []string{}
+		for _, m := range mailGroups {
+			cfgMailGroups = append(cfgMailGroups, m.Slug)
+		}
+
+		cfgMonitor := StatusnookConfigMonitor{
+			Name:                 v.Name,
+			URL:                  v.URL,
+			Method:               v.Method,
+			Frequency:            v.Frequency,
+			Timeout:              v.Timeout,
+			Attempts:             v.Attempts,
+			RequestHeaders:       v.RequestHeaders,
+			NotificationChannels: cfgNotificationChannels,
+			MailGroups:           cfgMailGroups,
+		}
+		if v.Body.String != "" {
+			if v.BodyFormat.String == "form" {
+				values, err := url.ParseQuery(v.Body.String)
+				if err != nil {
+					return cfgStr, fmt.Errorf("generateConfig.ParseQuery: %w", err)
+				}
+
+				flatValues := map[string]string{}
+				for k, v := range values {
+					flatValues[k] = v[0]
+				}
+
+				cfgMonitor.RequestBody = flatValues
+
+			} else {
+				cfgMonitor.RequestBody = v.Body.String
+			}
+		}
+
+		cfgMonitors[v.Slug] = cfgMonitor
+	}
+
+	services, err := listServices(tx)
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.listServices: %w", err)
+	}
+
+	cfgServices := map[string]StatusnookConfigService{}
+	for _, v := range services {
+		cfgServices[v.Slug] = StatusnookConfigService{Name: v.Name, Description: v.HelperText}
+	}
+
+	smtpNotificationChannelID, err := getAlertSMTPNotificationSetting(tx)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return cfgStr, fmt.Errorf("generateConfig.getAlertSMTPNotificationSetting: %w", err)
+	}
+
+	var smtpNotificationChannel NotificationChannel
+	if smtpNotificationChannelID != 0 {
+		smtpNotificationChannel, err = getNotificationChannelByID(tx, smtpNotificationChannelID)
+		if err != nil {
+			return cfgStr, fmt.Errorf("generateConfig.getNotificationChannelByID: %w", err)
+		}
+	}
+
+	alertSettings, err := getAlertSettings(tx)
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.getAlertSettings: %w", err)
+	}
+
+	cfg := StatusnookConfig{
+		MailGroups:           cfgMailGroups,
+		NotificationChannels: cfgNotificationChannels,
+		Monitors:             cfgMonitors,
+		Services:             cfgServices,
+		AlertNotificationSettings: StatusnookConfigAlertNotificationSettings{
+			EmailNotificationChannel: smtpNotificationChannel.Slug,
+			ManagedSubscriptions:     alertSettings.ManagedSubscriptions,
+			SlackClientSecret:        alertSettings.SlackClientSecret,
+			SlackInstallURL:          alertSettings.SlackInstallURL,
+		},
+		GeneralSettings: StatusnookConfigGeneralSettings{Name: metaName},
+	}
+
+	cfgBytes, err := yaml.Marshal(cfg)
+	if err != nil {
+		return cfgStr, fmt.Errorf("generateConfig.Marshal: %w", err)
+	}
+
+	cfgStr = string(cfgBytes)
+
+	return cfgStr, nil
+}
+
 func main() {
 	portFlag := flag.Int("port", 80, "")
 	selfSignedFlag := flag.Bool("generate-self-signed-cert", false, "")
@@ -2076,6 +3574,15 @@ func main() {
 	}
 	metaUnconfirmedDomainProblem = unconfirmedDomainProblem
 
+	configFileEnabled, err := getMetaValue(tx, "configFileEnabled")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Fatalf("main.getMetaValueConfigFileEnabled: %s", err)
+		return
+	}
+	if configFileEnabled == "true" {
+		metaConfigFileEnabled = true
+	}
+
 	ssl, err := getMetaValue(tx, "ssl")
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		log.Fatalf("main.getMetaValueSSL: %s", err)
@@ -2094,6 +3601,29 @@ func main() {
 		}
 	} else {
 		metaSSL = ssl
+	}
+
+	_, err = getMetaValue(tx, "secretKey")
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Fatalf("main.getMetaValueSecretKey: %s", err)
+			return
+		}
+
+		keyBytes := make([]byte, 32)
+		_, err = rand.Read(keyBytes)
+		if err != nil {
+			log.Printf("main.Read: %s", err)
+			return
+		}
+
+		keyB64 := base64.StdEncoding.EncodeToString(keyBytes)
+
+		err = updateMetaValue(tx, "secretKey", keyB64)
+		if err != nil {
+			log.Printf("main.updateMetaValueSecretKey: %s", err)
+			return
+		}
 	}
 
 	err = tx.Commit()
@@ -2205,6 +3735,7 @@ func main() {
 		r.Post("/resubscribe", postResubscribe)
 		r.Get("/invitation/{token}", getInvitation)
 		r.Post("/invitation/{token}", postInvitation)
+		r.Post("/github-config-webhook", configWebhook)
 	})
 	r.Route("/admin", func(r chi.Router) {
 		r.Use(csrfMiddleware)
@@ -2253,6 +3784,7 @@ func main() {
 			r.Post("/create", postCreateMonitor)
 			r.Get("/{id}/edit", getEditMonitor)
 			r.Post("/{id}/edit", postEditMonitor)
+			r.Get("/{id}/view", getDetailsMonitor)
 		})
 		r.Route("/services", func(r chi.Router) {
 			r.Get("/", services)
@@ -2269,11 +3801,13 @@ func main() {
 			r.Delete("/{id}", deleteNotificationChannel)
 			r.Get("/{id}/edit", getEditNotification)
 			r.Post("/{id}/edit", postEditNotification)
+			r.Get("/{id}/view", getViewNotification)
 			r.Route("/mail-groups", func(r chi.Router) {
 				r.Get("/create", getCreateMailGroup)
 				r.Post("/create", postCreateMailGroup)
 				r.Get("/{id}/edit", getEditMailGroup)
 				r.Post("/{id}/edit", postEditMailGroup)
+				r.Get("/{id}/view", getViewMailGroup)
 				r.Delete("/{id}", deleteMailGroup)
 			})
 		})
@@ -2292,6 +3826,13 @@ func main() {
 			r.Delete("/users/{id}", deleteUser)
 			r.Post("/users/invite", postInviteUser)
 			r.Delete("/users/invite/{id}", postDeleteInvite)
+			r.Post("/config", postConfig)
+			r.Route("/config-settings", func(r chi.Router) {
+				r.Get("/", getConfigSettings)
+				r.Post("/", postConfigSettings)
+				r.Post("/generate-webhook-secret", postGenerateWebhookSecret)
+			})
+			r.Post("/secrets", postSecret)
 		})
 	})
 	r.Route("/login", func(r chi.Router) {
@@ -5145,6 +6686,7 @@ func alerts(w http.ResponseWriter, r *http.Request) {
 
 type Monitor struct {
 	ID             int
+	Slug           string
 	Name           string
 	URL            string
 	Method         string
@@ -5158,7 +6700,7 @@ type Monitor struct {
 
 func listMonitors(tx *sql.Tx) ([]Monitor, error) {
 	const query = `
-		select id, name, url, method, frequency, timeout, attempts, request_headers, 
+		select id, slug, name, url, method, frequency, timeout, attempts, request_headers, 
 			body_format, body
 		from monitor
 	`
@@ -5177,6 +6719,7 @@ func listMonitors(tx *sql.Tx) ([]Monitor, error) {
 		monitor := Monitor{}
 		err = rows.Scan(
 			&monitor.ID,
+			&monitor.Slug,
 			&monitor.Name,
 			&monitor.URL,
 			&monitor.Method,
@@ -5242,13 +6785,15 @@ func monitors(w http.ResponseWriter, r *http.Request) {
 					<h2>Monitors</h2>
 				</div>
 
-				<div>
-					<a href="/admin/monitors/create" hx-boost="true">
-						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-							<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
-						</svg>
-					</a>
-				</div>
+				{{if not .Ctx.ConfigFile}}
+					<div>
+						<a href="/admin/monitors/create" hx-boost="true">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+								<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+							</svg>
+						</a>
+					</div>
+				{{end}}
 			</div>
 
 			{{if eq (len .Monitors) 0}}
@@ -5260,7 +6805,11 @@ func monitors(w http.ResponseWriter, r *http.Request) {
 						</svg>
 					</div>
 					<span>Create your first monitor</span>
-					<a class="action" href="/admin/monitors/create" hx-boost="true">Create monitor</a>
+					{{if not .Ctx.ConfigFile}}
+						<a class="action" href="/admin/monitors/create" hx-boost="true">Create monitor</a>
+					{{else}}
+						<a class="action" href="/admin/settings#config-form" hx-boost="true">Go to settings</a>
+					{{end}}
 				</div>
 			{{else}}
 				<div class="monitors-container">
@@ -5549,6 +7098,7 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 								</span>
 							{{end}}
 						</div>
+						
 						<div>
 							<div id="get-monitor-menu" class="menu" hx-preserve>
 								<button class="menu-button">
@@ -5558,8 +7108,12 @@ func getMonitor(w http.ResponseWriter, r *http.Request) {
 								</button>
 
 								<dialog>
-									<a href="/admin/monitors/{{.Monitor.ID}}/edit" hx-boost="true">Edit</a>
-									<button onclick="document.getElementById('delete-dialog').showModal();">Delete</button>
+									{{if not .Ctx.ConfigFile}}
+										<a href="/admin/monitors/{{.Monitor.ID}}/edit" hx-boost="true">Edit</a>
+										<button onclick="document.getElementById('delete-dialog').showModal();">Delete</button>
+									{{else}}
+										<a href="/admin/monitors/{{.Monitor.ID}}/view" hx-boost="true">Details</a>
+									{{end}}								
 								</dialog>
 							</div>
 							<dialog class="modal" id="delete-dialog">
@@ -6148,6 +7702,12 @@ func getMonitorPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func getEditMonitor(w http.ResponseWriter, r *http.Request) {
+	readOnly := strings.HasSuffix(r.URL.Path, "view")
+	if !readOnly && metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	refreshID := r.URL.Query().Get("refresh")
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
@@ -6199,7 +7759,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 	}
 	selectedMailGroupsMap := map[int]bool{}
 	for _, v := range selectedMailGroups {
-		selectedMailGroupsMap[v] = true
+		selectedMailGroupsMap[v.ID] = true
 	}
 
 	err = tx.Commit()
@@ -6210,7 +7770,13 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const markup = `
-		{{define "title"}}Edit monitor{{end}}
+		{{define "title"}}
+			{{if .ReadOnly}}
+				View monitor
+			{{else}}
+				Edit monitor
+			{{end}}
+		{{end}}
 		{{define "body"}}
 			<div class="create-monitor-container">
 				<div class="admin-nav-header">
@@ -6221,7 +7787,11 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 							</svg>
 						</a>
 				
-						<h2>Edit monitor</h2>
+						{{if .ReadOnly}}
+							<h2>View monitor</h2>
+						{{else}}
+							<h2>Edit monitor</h2>
+						{{end}}
 					</div>
 				</div>
 
@@ -6372,7 +7942,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 						<fieldset class="param-box">
 							<legend>Request headers</legend>
 							<div 
-								class="entity-empty-state entity-empty-state--secondary"
+								class="entity-empty-state {{if not .Ctx.ConfigFile}}entity-empty-state--secondary{{end}}"
 								{{if .Monitor.RequestHeaders}}style="display: none;"{{end}}
 							>
 								<div class="icon">
@@ -6381,13 +7951,17 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 									</svg>
 								</div>
 								<span>No headers set</span>
-								<button
-									class="action"
-									type="button"
-									onclick="addParamOnClick(this);"
-								>
-									Add header
-								</button>
+								{{if not .Ctx.ConfigFile}}
+									<button
+										class="action"
+										type="button"
+										onclick="addParamOnClick(this);"
+									>
+										Add header
+									</button>
+								{{else}}
+									<a class="action" href="/admin/settings#config-form" hx-swap="outerHTML" hx-boost="true">Go to settings</a>
+								{{end}}
 							</div>
 							<fieldset 
 								class="param-box__inputs"
@@ -6557,7 +8131,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 
 						{{if not (len .Notifications)}}
 							<div
-								class="entity-empty-state entity-empty-state--secondary" 
+								class="entity-empty-state {{if not .Ctx.ConfigFile}}entity-empty-state--secondary{{end}}" 
 								style="margin-top: 1.0rem;"
 							>
 								<div class="icon">
@@ -6567,19 +8141,23 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 								</div>
 								<span>No notification channels found</span>
 								<div class="actions">
-									<a class="action" href="/admin/notifications/create" target="_blank">
-										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-											<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-											<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
-										</svg>
-										Add channel
-									</a>
-									<button type="button" class="empty-state-refresh" hx-get="?refresh=notification-channels">
-										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-											<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
-										</svg>
-										Refresh
-									</button>
+									{{if not .Ctx.ConfigFile}}
+										<a class="action" href="/admin/notifications/create" target="_blank">
+											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+												<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+												<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+											</svg>
+											Add channel
+										</a>
+										<button type="button" class="empty-state-refresh" hx-get="?refresh=notification-channels">
+											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+												<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
+											</svg>
+											Refresh
+										</button>
+									{{else}}
+										<a class="action" href="/admin/settings#config-form" hx-swap="outerHTML" hx-boost="true">Go to settings</a>
+									{{end}}
 								</div>
 							</div>
 						{{end}}
@@ -6629,7 +8207,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 
 						{{if not (len .MailGroups)}}
 							<div
-								class="entity-empty-state entity-empty-state--secondary" 
+								class="entity-empty-state {{if not .Ctx.ConfigFile}}entity-empty-state--secondary{{end}}" 
 								style="margin-top: 1.0rem;"
 							>
 								<div class="icon">
@@ -6642,19 +8220,23 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 									No mail groups found
 								</span>
 								<div class="actions">
-									<a class="action" href="/admin/notifications/mail-groups/create" target="_blank">
-										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-											<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-											<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
-										</svg>
-										Add mail group
-									</a>
-									<button type="button" class="empty-state-refresh" hx-get="?refresh=notification-mail-groups">
-										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-											<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
-										</svg>
-										Refresh
-									</button>
+									{{if not .Ctx.ConfigFile}}
+										<a class="action" href="/admin/notifications/mail-groups/create" target="_blank">
+											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+												<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+												<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+											</svg>
+											Add mail group
+										</a>
+										<button type="button" class="empty-state-refresh" hx-get="?refresh=notification-mail-groups">
+											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+												<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
+											</svg>
+											Refresh
+										</button>
+									{{else}}
+										<a class="action" href="/admin/settings#config-form" hx-swap="outerHTML" hx-boost="true">Go to settings</a>
+									{{end}}
 								</div>
 							</div>
 						{{end}}
@@ -6682,7 +8264,9 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 					</fieldset>
 					
 					<div>
-						<button type="submit">Edit</button>
+						{{if not .ReadOnly}}
+							<button type="submit">Edit</button>
+						{{end}}
 					</div>
 
 					<link
@@ -6824,6 +8408,15 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 
 							const form = document.querySelector("form");
 
+							{{if .ReadOnly}}
+								[...form.elements].forEach((v) => {
+									if (v.tagName === "FIELDSET") {
+										return;
+									}
+									v.disabled = true;
+								});
+							{{end}}
+
 							if (window.monaco) {
 								window.monaco.editor.getModels().forEach(model => model.dispose());
 								initEditor();
@@ -6839,6 +8432,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 									padding: {top: 24},
 									automaticLayout: true,
 									value: "{{.TextBody}}",
+									{{if .Ctx.ConfigFile}}readOnly: true{{end}}
 								});	
 																	
 								editor.getModel().onDidChangeContent((event) => {
@@ -6893,6 +8487,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 			MailGroups           []MailGroup
 			SelectedMailGroups   map[int]bool
 			RefreshID            string
+			ReadOnly             bool
 			Ctx                  pageCtx
 		}{
 			Monitor:              monitor,
@@ -6903,6 +8498,7 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 			MailGroups:           mailGroups,
 			SelectedMailGroups:   selectedMailGroupsMap,
 			RefreshID:            refreshID,
+			ReadOnly:             readOnly,
 			Ctx:                  getPageCtx(r),
 		},
 	)
@@ -6911,6 +8507,10 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+}
+
+func getDetailsMonitor(w http.ResponseWriter, r *http.Request) {
+	getEditMonitor(w, r)
 }
 
 func editMonitor(
@@ -6953,7 +8553,27 @@ func editMonitor(
 	return id, nil
 }
 
+func updateMonitorSlug(tx *sql.Tx, old string, new string) (int, error) {
+	const query = `
+		update monitor set slug = ? where slug = ? returning id
+	`
+
+	var id int
+
+	err := tx.QueryRow(query, new, old).Scan(&id)
+	if err != nil {
+		return id, fmt.Errorf("updateMonitorSlug.QueryRow: %w", err)
+	}
+
+	return id, nil
+}
+
 func postEditMonitor(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	if name == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -7257,7 +8877,7 @@ func getCreateMonitor(w http.ResponseWriter, r *http.Request) {
 					<form hx-post hx-swap="none" autocomplete="off">
 						<label>
 							Name
-							<input name="name" placeholder="My website" required />
+							<input name="name" placeholder="My website" required>
 						</label>
 	
 						<label>
@@ -7888,6 +9508,7 @@ func updateMonitorNotificationChannels(tx *sql.Tx, monitorID int, channelIDs []i
 
 func createMonitor(
 	tx *sql.Tx,
+	slug string,
 	name string,
 	url string,
 	method string,
@@ -7900,14 +9521,15 @@ func createMonitor(
 ) (int, error) {
 	const query = `
 		insert into
-			monitor(name, url, method, frequency, timeout, attempts, request_headers, 
+			monitor(slug, name, url, method, frequency, timeout, attempts, request_headers, 
 				body_format, body)
-			values(?, ?, ?, ?, ?, ?, ?, ?, ?) returning id
+			values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id
 	`
 
 	var monitorID int
 	err := tx.QueryRow(
 		query,
+		slug,
 		name,
 		url,
 		method,
@@ -7926,6 +9548,11 @@ func createMonitor(
 }
 
 func postCreateMonitor(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	if name == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -8075,8 +9702,21 @@ func postCreateMonitor(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
+	monitors, err := listMonitors(tx)
+	if err != nil {
+		log.Printf("postCreateMonitor.listMonitors: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	monitorSlugs := map[string]bool{}
+	for _, v := range monitors {
+		monitorSlugs[v.Slug] = true
+	}
+
 	monitorID, err := createMonitor(
 		tx,
+		generateSlug(name, monitorSlugs),
 		name,
 		reqURL,
 		method,
@@ -8368,7 +10008,7 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 						>
 							{{if not (len .Notifications)}}
 								<div
-									class="entity-empty-state entity-empty-state--secondary" 
+									class="entity-empty-state {{if not .Ctx.ConfigFile}}entity-empty-state--secondary{{end}}" 
 									style="width: 100%; margin-top: 1.0rem;"
 								>
 									<div class="icon">
@@ -8379,25 +10019,37 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 									</div>
 									<span>No email notification channels found</span>
 									<div class="actions">
-										<a 
-											class="action"
-											href="/admin/notifications/create"
-											target="_blank"
-											hx-boost="true"
-											hx-swap="outerHTML"
-										>
-											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-												<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-												<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
-											</svg>
-											Add channel
-										</a>
-										<button type="button" class="empty-state-refresh" hx-get="">
-											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-												<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
-											</svg>
-											Refresh
-										</button>
+										{{if not .Ctx.ConfigFile}}
+											<a 
+												class="action"
+												href="/admin/notifications/create"
+												target="_blank"
+												hx-boost="true"
+												hx-swap="outerHTML"
+											>
+												<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+													<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+													<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+												</svg>
+												Add channel
+											</a>
+											<button type="button" class="empty-state-refresh" hx-get="">
+												<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+													<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
+												</svg>
+												Refresh
+											</button>
+										{{else}}
+											<a 
+												class="action"
+												href="/admin/settings#config-form"
+												target="_blank"
+												hx-boost="true"
+												hx-swap="outerHTML"
+											>
+												Go to settings
+											</a>
+										{{end}}
 									</div>
 								</div>
 							{{end}}
@@ -8557,11 +10209,22 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 					</div>
 					
 					<div>
-						<button type="submit">Confirm</button>
+						{{if not .Ctx.ConfigFile}}
+							<button type="submit">Confirm</button>
+						{{end}}
 					</div>
 				</form>
 			</div>
 			<script>
+				{{if .ConfigFileEnabled}}
+					[...document.querySelector("form").elements].forEach((v) => {
+						if (v.tagName === "FIELDSET" || v.classList.contains("help")) {
+							return;
+						}
+						v.disabled = true;
+					});
+				{{end}}
+
 				function onChangeChannel(e) {
 					const form = e.closest("form");
 
@@ -8587,12 +10250,14 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 		Settings                AlertSettings
 		SMTPNotificationChannel int
 		Domain                  string
+		ConfigFileEnabled       bool
 		Ctx                     pageCtx
 	}{
 		Notifications:           notifications,
 		Settings:                settings,
 		SMTPNotificationChannel: smtpNotificationChannelID,
 		Domain:                  metaDomain,
+		ConfigFileEnabled:       metaConfigFileEnabled,
 		Ctx:                     getPageCtx(r),
 	})
 	if err != nil {
@@ -8654,6 +10319,11 @@ func updateAlertSMTPNotificationSetting(tx *sql.Tx, notificationID int) error {
 }
 
 func postAlertNotifications(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	slackInstallURLParam := r.FormValue("slack-install-url")
 	slackInstallURL := ""
 	if slackInstallURLParam != "" {
@@ -10311,6 +11981,7 @@ func postEditAlertMessage(w http.ResponseWriter, r *http.Request) {
 
 type service struct {
 	ID         int
+	Slug       string
 	Name       string
 	HelperText string
 }
@@ -10318,7 +11989,7 @@ type service struct {
 func listServices(tx *sql.Tx) ([]service, error) {
 	const query = `
 		select 
-			id, name, helper_text
+			id, slug, name, helper_text
 		from
 			service
 	`
@@ -10335,6 +12006,7 @@ func listServices(tx *sql.Tx) ([]service, error) {
 		svc := service{}
 		err = rows.Scan(
 			&svc.ID,
+			&svc.Slug,
 			&svc.Name,
 			&svc.HelperText,
 		)
@@ -10379,13 +12051,15 @@ func services(w http.ResponseWriter, r *http.Request) {
 					<h2>Services</h2>
 				</div>
 
-				<div>
-					<a href="/admin/services/create" hx-boost="true">
-						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-							<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
-						</svg>
-					</a>
-				</div>
+				{{if not .Ctx.ConfigFile}}
+					<div>
+						<a href="/admin/services/create" hx-boost="true">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+								<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+							</svg>
+						</a>
+					</div>
+				{{end}}
 			</div>
 
 			{{if eq (len .Services) 0}}
@@ -10396,7 +12070,11 @@ func services(w http.ResponseWriter, r *http.Request) {
 						</svg>
 					</div>
 					<span>Add your first service</span>
-					<a class="action" href="/admin/services/create" hx-boost="true">Add service</a>
+					{{if not .Ctx.ConfigFile}}
+						<a class="action" href="/admin/services/create" hx-boost="true">Add service</a>
+					{{else}}
+						<a class="action" href="/admin/settings#config-form" hx-boost="true">Go to settings</a>
+					{{end}}
 				</div>
 			{{else}}
 				<div class="services-container">
@@ -10406,27 +12084,29 @@ func services(w http.ResponseWriter, r *http.Request) {
 								<span>{{$service.Name}}</span>
 								<span>{{$service.HelperText}}</span>
 							</div>
-							<div class="menu">
-								<button class="menu-button">
-									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-										<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
-									</svg>
-								</button>
+							{{if not $.Ctx.ConfigFile}}
+								<div class="menu">
+									<button class="menu-button">
+										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+											<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
+										</svg>
+									</button>
 
-								<dialog>
-									<a href="/admin/services/{{$service.ID}}/edit" hx-boost="true">Edit</a>
-									<button onclick="document.getElementById('dialog-{{$service.ID}}').showModal();">Delete</button>
+									<dialog>
+										<a href="/admin/services/{{$service.ID}}/edit" hx-boost="true">Edit</a>
+										<button onclick="document.getElementById('dialog-{{$service.ID}}').showModal();">Delete</button>
+									</dialog>
+								</div>
+								<dialog class="modal" id="dialog-{{$service.ID}}">
+									<span>Delete {{$service.Name}}</span>
+									<form hx-delete="/admin/services/{{$service.ID}}" hx-swap="none">
+										<div>
+											<button onclick="document.getElementById('dialog-{{$service.ID}}').close(); return false;">Cancel</button>
+											<button><span></span>Delete</button>
+										</div>
+									</form>
 								</dialog>
-							</div>
-							<dialog class="modal" id="dialog-{{$service.ID}}">
-								<span>Delete {{$service.Name}}</span>
-								<form hx-delete="/admin/services/{{$service.ID}}" hx-swap="none">
-									<div>
-										<button onclick="document.getElementById('dialog-{{$service.ID}}').close(); return false;">Cancel</button>
-										<button><span></span>Delete</button>
-									</div>
-								</form>
-							</dialog>
+							{{end}}
 						</div>
 					{{end}}
 				</div>
@@ -10516,12 +12196,12 @@ func getCreateService(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func createService(tx *sql.Tx, name string, helperText string) error {
+func createService(tx *sql.Tx, slug string, name string, helperText string) error {
 	const query = `
-		insert into service(name, helper_text) values(?, ?)
+		insert into service(slug, name, helper_text) values(?, ?, ?)
 	`
 
-	_, err := tx.Exec(query, name, helperText)
+	_, err := tx.Exec(query, slug, name, helperText)
 	if err != nil {
 		return fmt.Errorf("createService.Exec: %w", err)
 	}
@@ -10530,6 +12210,11 @@ func createService(tx *sql.Tx, name string, helperText string) error {
 }
 
 func postCreateService(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	helperText := r.PostFormValue("helper")
 
@@ -10546,14 +12231,19 @@ func postCreateService(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, err = listServices(tx)
+	services, err := listServices(tx)
 	if err != nil {
 		log.Printf("postCreateService.listServices: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	err = createService(tx, name, helperText)
+	serviceSlugs := map[string]bool{}
+	for _, v := range services {
+		serviceSlugs[v.Slug] = true
+	}
+
+	err = createService(tx, generateSlug(name, serviceSlugs), name, helperText)
 	if err != nil {
 		log.Printf("postCreateService.createService: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -10633,6 +12323,12 @@ func getServiceByID(tx *sql.Tx, id int) (service, error) {
 }
 
 func getEditService(w http.ResponseWriter, r *http.Request) {
+	readOnly := strings.HasSuffix(r.URL.Path, "view")
+	if !readOnly && metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -10731,7 +12427,27 @@ func editService(tx *sql.Tx, id int, name string, helperText string) error {
 	return nil
 }
 
+func updateServiceSlug(tx *sql.Tx, old string, new string) (int, error) {
+	const query = `
+		update service set slug = ? where slug = ? returning id
+	`
+
+	var id int
+
+	err := tx.QueryRow(query, new, old).Scan(&id)
+	if err != nil {
+		return id, fmt.Errorf("updateServiceSlug.Exec: %w", err)
+	}
+
+	return id, nil
+}
+
 func postEditService(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -10814,13 +12530,15 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 				<div class="notification-channels-header">
 					<h2>Channels</h2>
 
-					<div>
-						<a href="/admin/notifications/create" hx-boost="true">
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-								<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
-							</svg>
-						</a>
-					</div>
+					{{if not .Ctx.ConfigFile}}
+						<div>
+							<a href="/admin/notifications/create" hx-boost="true">
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+									<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+								</svg>
+							</a>
+						</div>
+					{{end}}
 				</div>
 
 				<div style="margin-bottom: 5.0rem;">
@@ -10832,12 +12550,20 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 								</svg>
 							</div>
 							<span>Add your first notification channel</span>
-							<a class="action" href="/admin/notifications/create" hx-boost="true">Add channel</a>
+							{{if not .Ctx.ConfigFile}}
+								<a class="action" href="/admin/notifications/create" hx-boost="true">Add channel</a>
+							{{else}}
+								<a class="action" href="/admin/settings#config-form" hx-boost="true">Go to settings</a>
+							{{end}}
 						</div>
 					{{else}}
 						<div class="notifications-list">
 							{{range $notification := .Notifications}}
-								<div href="/" hx-boost="true">
+								{{if $.Ctx.ConfigFile}}
+								<a href="/admin/notifications/{{$notification.ID}}/view" hx-boost="true">
+								{{else}}
+								<div>
+								{{end}}
 									<div>
 										{{if eq $notification.Type "smtp"}}
 											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
@@ -10871,28 +12597,34 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 											{{end}}
 										</div>
 									</div>
-									<div class="menu">
-										<button class="menu-button">
-											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-												<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
-											</svg>
-										</button>
+									{{if not $.Ctx.ConfigFile}}
+										<div class="menu">
+											<button class="menu-button">
+												<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+													<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
+												</svg>
+											</button>
 
-										<dialog>
-											<a href="/admin/notifications/{{$notification.ID}}/edit" hx-boost="true">Edit</a>
-											<button onclick="document.getElementById('dialog-channel-{{$notification.ID}}').showModal();">Delete</button>
+											<dialog>
+												<a href="/admin/notifications/{{$notification.ID}}/edit" hx-boost="true">Edit</a>
+												<button onclick="document.getElementById('dialog-channel-{{$notification.ID}}').showModal();">Delete</button>
+											</dialog>
+										</div>
+										<dialog class="modal" id="dialog-channel-{{$notification.ID}}">
+											<span>Delete {{$notification.Name}}</span>
+											<form hx-delete="/admin/notifications/{{$notification.ID}}" hx-swap="none">
+												<div>
+													<button onclick="document.getElementById('dialog-channel-{{$notification.ID}}').close(); return false;">Cancel</button>
+													<button><span></span>Delete</button>
+												</div>
+											</form>
 										</dialog>
-									</div>
-									<dialog class="modal" id="dialog-channel-{{$notification.ID}}">
-										<span>Delete {{$notification.Name}}</span>
-										<form hx-delete="/admin/notifications/{{$notification.ID}}" hx-swap="none">
-											<div>
-												<button onclick="document.getElementById('dialog-channel-{{$notification.ID}}').close(); return false;">Cancel</button>
-												<button><span></span>Delete</button>
-											</div>
-										</form>
-									</dialog>
+									{{end}}
+								{{if $.Ctx.ConfigFile}}
+								</a>
+								{{else}}
 								</div>
+								{{end}}
 							{{end}}
 						</div>
 					{{end}}
@@ -10900,13 +12632,15 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 
 				<div class="notification-channels-header">
 					<h2>Mail groups</h2>
-					<div>
-						<a href="/admin/notifications/mail-groups/create" hx-boost="true">
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-								<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
-							</svg>
-						</a>
-					</div>
+					{{if not .Ctx.ConfigFile}}
+						<div>
+							<a href="/admin/notifications/mail-groups/create" hx-boost="true">
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+									<path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+								</svg>
+							</a>
+						</div>
+					{{end}}
 				</div>
 
 				{{if eq (len .MailGroups) 0}}
@@ -10918,12 +12652,20 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 							</svg>
 						</div>
 						<span>Create your first mail group</span>
-						<a class="action" href="/admin/notifications/mail-groups/create" hx-boost="true">Add mail group</a>
+						{{if not .Ctx.ConfigFile}}
+							<a class="action" href="/admin/notifications/mail-groups/create" hx-boost="true">Add mail group</a>
+						{{else}}
+							<a class="action" href="/admin/settings#config-form" hx-boost="true">Go to settings</a>
+						{{end}}
 					</div>
 				{{else}}
 					<div class="notifications-list">
 						{{range $mailGroup := .MailGroups}}
-							<div href="/" hx-boost="true">
+							{{if $.Ctx.ConfigFile}}
+							<a href="/admin/notifications/mail-groups/{{$mailGroup.ID}}/view" hx-boost="true">
+							{{else}}
+							<div>
+							{{end}}
 								<div>
 									<div>
 										<span>{{$mailGroup.Name}}</span>
@@ -10932,28 +12674,34 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 										{{end}}
 									</div>
 								</div>
-								<div class="menu">
-									<button class="menu-button">
-										<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-											<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
-										</svg>
-									</button>
+								{{if not $.Ctx.ConfigFile}}
+									<div class="menu">
+										<button class="menu-button">
+											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+												<path d="M3 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM8.5 10a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zM15.5 8.5a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" />
+											</svg>
+										</button>
 
-									<dialog>
-										<a href="/admin/notifications/mail-groups/{{$mailGroup.ID}}/edit" hx-boost="true">Edit</a>
-										<button onclick="document.getElementById('dialog-mail-group-{{$mailGroup.ID}}').showModal();">Delete</button>
+										<dialog>
+											<a href="/admin/notifications/mail-groups/{{$mailGroup.ID}}/edit" hx-boost="true">Edit</a>
+											<button onclick="document.getElementById('dialog-mail-group-{{$mailGroup.ID}}').showModal();">Delete</button>
+										</dialog>
+									</div>
+									<dialog class="modal" id="dialog-mail-group-{{$mailGroup.ID}}">
+										<span>Delete {{$mailGroup.Name}}</span>
+										<form hx-delete="/admin/notifications/mail-groups/{{$mailGroup.ID}}" hx-swap="none">
+											<div>
+												<button onclick="document.getElementById('dialog-mail-group-{{$mailGroup.ID}}').close(); return false;">Cancel</button>
+												<button><span></span>Delete</button>
+											</div>
+										</form>
 									</dialog>
-								</div>
-								<dialog class="modal" id="dialog-mail-group-{{$mailGroup.ID}}">
-									<span>Delete {{$mailGroup.Name}}</span>
-									<form hx-delete="/admin/notifications/mail-groups/{{$mailGroup.ID}}" hx-swap="none">
-										<div>
-											<button onclick="document.getElementById('dialog-mail-group-{{$mailGroup.ID}}').close(); return false;">Cancel</button>
-											<button><span></span>Delete</button>
-										</div>
-									</form>
-								</dialog>
+								{{end}}
+							{{if $.Ctx.ConfigFile}}
+							</a>
+							{{else}}
 							</div>
+							{{end}}
 						{{end}}
 					</div>
 				{{end}}
@@ -11336,6 +13084,7 @@ type SlackNotificationDetails struct {
 
 type NotificationChannel struct {
 	ID      int
+	Slug    string
 	Name    string
 	Type    string
 	Details any
@@ -11347,7 +13096,7 @@ type listNotificationsOptions struct {
 
 func listNotificationChannels(tx *sql.Tx, options listNotificationsOptions) ([]NotificationChannel, error) {
 	const baseQuery = `
-		select id, name, type, details from notification_channel
+		select id, slug, name, type, details from notification_channel
 	`
 
 	query := baseQuery
@@ -11371,7 +13120,7 @@ func listNotificationChannels(tx *sql.Tx, options listNotificationsOptions) ([]N
 		var detailsStr string
 		var channel NotificationChannel
 
-		err := rows.Scan(&channel.ID, &channel.Name, &channel.Type, &detailsStr)
+		err := rows.Scan(&channel.ID, &channel.Slug, &channel.Name, &channel.Type, &detailsStr)
 		if err != nil {
 			return channels, fmt.Errorf("listNotificationChannels.Scan: %w", err)
 		}
@@ -11404,8 +13153,8 @@ func listNotificationChannels(tx *sql.Tx, options listNotificationsOptions) ([]N
 
 func listNotificationChannelsByMonitorID(tx *sql.Tx, monitorID int) ([]NotificationChannel, error) {
 	const query = `
-		select notification_channel.id, notification_channel.name, notification_channel.type, 
-		notification_channel.details 
+		select notification_channel.id, notification_channel.slug, 
+		notification_channel.name, notification_channel.type, notification_channel.details 
 		from monitor_notification_channel
 		left join notification_channel on 
 			notification_channel.id = monitor_notification_channel.notification_channel_id
@@ -11424,7 +13173,7 @@ func listNotificationChannelsByMonitorID(tx *sql.Tx, monitorID int) ([]Notificat
 		var detailsStr string
 		var channel NotificationChannel
 
-		err := rows.Scan(&channel.ID, &channel.Name, &channel.Type, &detailsStr)
+		err := rows.Scan(&channel.ID, &channel.Slug, &channel.Name, &channel.Type, &detailsStr)
 		if err != nil {
 			return notifications, fmt.Errorf("listNotificationChannelsByMonitorID.Scan: %w", err)
 		}
@@ -11457,15 +13206,16 @@ func listNotificationChannelsByMonitorID(tx *sql.Tx, monitorID int) ([]Notificat
 
 func createNotification(
 	tx *sql.Tx,
+	slug string,
 	name string,
 	notificationType string,
 	details string,
 ) error {
 	const query = `
-		insert into notification_channel(name, type, details) values(?, ?, ?)
+		insert into notification_channel(slug, name, type, details) values(?, ?, ?, ?)
 	`
 
-	_, err := tx.Exec(query, name, notificationType, details)
+	_, err := tx.Exec(query, slug, name, notificationType, details)
 	if err != nil {
 		return fmt.Errorf("createNotification.Exec: %w", err)
 	}
@@ -11474,6 +13224,11 @@ func createNotification(
 }
 
 func postCreateNotification(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	notificationType := r.PostFormValue("type")
 	if notificationType != "smtp" && notificationType != "slack" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -11573,8 +13328,21 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		channels, err := listNotificationChannels(tx, listNotificationsOptions{})
+		if err != nil {
+			log.Printf("postCreateNotification.listNotificationChannelsSMTP: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		channelSlugs := map[string]bool{}
+		for _, v := range channels {
+			channelSlugs[v.Slug] = true
+		}
+
 		err = createNotification(
 			tx,
+			generateSlug(displayName, channelSlugs),
 			displayName,
 			notificationType,
 			string(serializedDetails),
@@ -11614,8 +13382,21 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		channels, err := listNotificationChannels(tx, listNotificationsOptions{})
+		if err != nil {
+			log.Printf("postCreateNotification.listNotificationChannelsSlack: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		channelSlugs := map[string]bool{}
+		for _, v := range channels {
+			channelSlugs[v.Slug] = true
+		}
+
 		err = createNotification(
 			tx,
+			generateSlug(displayName, channelSlugs),
 			displayName,
 			notificationType,
 			string(serializedDetails),
@@ -11638,7 +13419,7 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 
 func getNotificationChannelByID(tx *sql.Tx, id int) (NotificationChannel, error) {
 	const query = `
-		select id, name, type, details from notification_channel
+		select id, slug, name, type, details from notification_channel
 		where id = ?
 	`
 
@@ -11647,6 +13428,7 @@ func getNotificationChannelByID(tx *sql.Tx, id int) (NotificationChannel, error)
 
 	err := tx.QueryRow(query, id).Scan(
 		&channel.ID,
+		&channel.Slug,
 		&channel.Name,
 		&channel.Type,
 		&detailsStr,
@@ -11678,7 +13460,56 @@ func getNotificationChannelByID(tx *sql.Tx, id int) (NotificationChannel, error)
 	return channel, nil
 }
 
+func getNotificationChannelBySlug(tx *sql.Tx, slug string) (NotificationChannel, error) {
+	const query = `
+		select id, slug, name, type, details from notification_channel
+		where slug = ?
+	`
+
+	var channel NotificationChannel
+	var detailsStr string
+
+	err := tx.QueryRow(query, slug).Scan(
+		&channel.ID,
+		&channel.Slug,
+		&channel.Name,
+		&channel.Type,
+		&detailsStr,
+	)
+	if err != nil {
+		return channel, fmt.Errorf("getNotificationChannelBySlug.QueryRow: %w", err)
+	}
+
+	if channel.Type == "smtp" {
+		var details SMTPNotificationDetails
+
+		err := json.Unmarshal([]byte(detailsStr), &details)
+		if err != nil {
+			return channel, fmt.Errorf("getNotificationChannelBySlug.UnmarshalSMTP: %w", err)
+		}
+
+		channel.Details = details
+	} else if channel.Type == "slack" {
+		var details SlackNotificationDetails
+
+		err := json.Unmarshal([]byte(detailsStr), &details)
+		if err != nil {
+			return channel, fmt.Errorf("getNotificationChannelBySlug.UnmarshalSlack: %w", err)
+		}
+
+		channel.Details = details
+	}
+
+	return channel, nil
+}
+
 func getEditNotification(w http.ResponseWriter, r *http.Request) {
+	readOnly := strings.HasSuffix(r.URL.Path, "view")
+	if !readOnly && metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -11708,7 +13539,13 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const markup = `
-		{{define "title"}}Edit notification channel{{end}}
+		{{define "title"}}
+			{{if .ReadOnly}}
+				View notification channel
+			{{else}}
+				Edit notification channel
+			{{end}}
+		{{end}}
 		{{define "body"}}
 			<div class="create-service-container">
 				<div class="admin-nav-header">
@@ -11719,7 +13556,11 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 							</svg>
 						 </a>
 				  
-						<h2>Edit notification channel</h2>
+						{{if .ReadOnly}}
+							<h2>View notification channel</h2>
+						{{else}}
+							<h2>Edit notification channel</h2>
+						{{end}}
 					</div>
 				</div>
 
@@ -11839,13 +13680,15 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 											</svg>
 										</div>
 										<span>No headers set</span>
-										<button
-											class="action"
-											type="button"
-											onclick="addParamOnClick(this);"
-										>
-											Add header
-										</button>
+										{{if not .ReadOnly}}
+											<button
+												class="action"
+												type="button"
+												onclick="addParamOnClick(this);"
+											>
+												Add header
+											</button>
+										{{end}}
 									</div>
 									<fieldset 
 										class="param-box__inputs"
@@ -11970,11 +13813,22 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 					{{end}}
 
 					<div>
-						<button type="submit">Edit</button>
+						{{if not .ReadOnly}}
+							<button type="submit">Edit</button>
+						{{end}}
 					</div>
 				</form>
 			</div>
 			<script>
+				{{if .ReadOnly}}
+					[...document.querySelector("form").elements].forEach((v) => {
+						if (v.tagName === "FIELDSET" || v.classList.contains("help")) {
+							return;
+						}
+						v.disabled = true;
+					});
+				{{end}}
+
 				function onInputHost(e) {
 					const postmarkFieldSet = document.querySelector("#postmark");
 
@@ -12051,10 +13905,12 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 		struct {
 			Notification NotificationChannel
 			IsPostmark   bool
+			ReadOnly     bool
 			Ctx          pageCtx
 		}{
 			Notification: channel,
 			IsPostmark:   isPostmark,
+			ReadOnly:     readOnly,
 			Ctx:          getPageCtx(r),
 		},
 	)
@@ -12079,7 +13935,27 @@ func editNotificationChannel(tx *sql.Tx, channel NotificationChannel) error {
 	return nil
 }
 
+func updateNotificationChannelSlug(tx *sql.Tx, old string, new string) (int, error) {
+	const query = `
+		update notification_channel set slug = ? where slug = ? returning id
+	`
+
+	var id int
+
+	err := tx.QueryRow(query, new, old).Scan(&id)
+	if err != nil {
+		return id, fmt.Errorf("updateNotificationChannelSlug.QueryRow: %w", err)
+	}
+
+	return id, nil
+}
+
 func postEditNotification(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	idParam := chi.URLParam(r, "id")
 	notificationID, err := strconv.Atoi(idParam)
 	if err != nil {
@@ -12243,6 +14119,10 @@ func postEditNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Add("HX-Location", "/admin/notifications")
+}
+
+func getViewNotification(w http.ResponseWriter, r *http.Request) {
+	getEditNotification(w, r)
 }
 
 func deleteNotificationChannelByID(tx *sql.Tx, id int) error {
@@ -12430,6 +14310,12 @@ func getCreateMailGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
+	readOnly := strings.HasSuffix(r.URL.Path, "view")
+	if !readOnly && metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -12466,7 +14352,13 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const markup = `
-		{{define "title"}}Edit mail group{{end}}
+		{{define "title"}}
+			{{if .ReadOnly}}
+				View mail group
+			{{else}}
+				Edit mail group
+			{{end}}
+		{{end}}
 		{{define "body"}}
 			<div class="create-service-container">
 				<div class="admin-nav-header">
@@ -12476,8 +14368,12 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 								<path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
 							</svg>
 						</a>
-				
-						<h2>Edit mail group</h2>
+					
+						{{if .ReadOnly}}
+							<h2>View mail group</h2>
+						{{else}}
+							<h2>Edit mail group</h2>
+						{{end}}
 					</div>
 				</div>
 
@@ -12494,7 +14390,7 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 					
 					<fieldset class="param-box">
 						<legend>Members</legend>
-						<div class="entity-empty-state entity-empty-state--secondary"
+						<div class="entity-empty-state {{if not .Ctx.ConfigFile}}entity-empty-state--secondary{{end}}"
 							{{if .MailGroupMembers}}style="display: none;"{{end}}
 						>
 							<div class="icon">
@@ -12503,13 +14399,17 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 								</svg>
 							</div>
 							<span>No members</span>
-							<button
-								class="action"
-								type="button"
-								onclick="addParamOnClick(this);"
-							>
-								Add member
-							</button>
+							{{if not .Ctx.ConfigFile}}
+								<button
+									class="action"
+									type="button"
+									onclick="addParamOnClick(this);"
+								>
+									Add member
+								</button>
+							{{else}}
+								<a class="action" href="/admin/settings#config-form" hx-swap="outerHTML" hx-boost="true">Go to settings</a>
+							{{end}}
 						</div>
 						<fieldset class="param-box__inputs" {{if not .MailGroupMembers}}disabled{{end}}>
 							<legend class="hide">Request headers list</legend>
@@ -12554,11 +14454,22 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 					</fieldset>
 
 					<div>
-						<button type="submit">Create</button>
+						{{if not .Ctx.ConfigFile}}
+							<button type="submit">Create</button>
+						{{end}}
 					</div>
 				</form>
 			</div>
 			<script>
+				{{if .ReadOnly}}
+					[...document.querySelector("form").elements].forEach((v) => {
+						if (v.tagName === "FIELDSET") {
+							return;
+						}
+						v.disabled = true;
+					});
+				{{end}}
+
 				function addParamOnClick(e) {
 					const root = e.closest(".param-box");
 
@@ -12616,10 +14527,12 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 		struct {
 			MailGroup        MailGroup
 			MailGroupMembers []MailGroupMember
+			ReadOnly         bool
 			Ctx              pageCtx
 		}{
 			MailGroup:        mailGroup,
 			MailGroupMembers: mailGroupMembers,
+			ReadOnly:         readOnly,
 			Ctx:              getPageCtx(r),
 		},
 	)
@@ -12630,15 +14543,20 @@ func getEditMailGroup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func getViewMailGroup(w http.ResponseWriter, r *http.Request) {
+	getEditMailGroup(w, r)
+}
+
 type MailGroup struct {
 	ID          int
+	Slug        string
 	Name        string
 	Description string
 }
 
 func listMailGroups(tx *sql.Tx) ([]MailGroup, error) {
 	const query = `
-		select id, name, description from mail_group
+		select id, slug, name, description from mail_group
 	`
 
 	mailGroups := []MailGroup{}
@@ -12651,7 +14569,7 @@ func listMailGroups(tx *sql.Tx) ([]MailGroup, error) {
 
 	for rows.Next() {
 		mailGroup := MailGroup{}
-		err = rows.Scan(&mailGroup.ID, &mailGroup.Name, &mailGroup.Description)
+		err = rows.Scan(&mailGroup.ID, &mailGroup.Slug, &mailGroup.Name, &mailGroup.Description)
 		if err != nil {
 			return mailGroups, fmt.Errorf("listMailGroups.Scan: %w", err)
 		}
@@ -12698,31 +14616,37 @@ func updateMonitorMailGroups(tx *sql.Tx, monitorID int, mailGroupIDs []int) erro
 	return nil
 }
 
-func listMailGroupIDsByMonitorID(tx *sql.Tx, monitorID int) ([]int, error) {
+type MailGroupIDs struct {
+	ID   int
+	Slug string
+}
+
+func listMailGroupIDsByMonitorID(tx *sql.Tx, monitorID int) ([]MailGroupIDs, error) {
 	const query = `
-		select mail_group_id from mail_group_monitor 
+		select mail_group_id, slug from mail_group_monitor 
+		left join mail_group on mail_group.id = mail_group_id
 		where monitor_id = ?
 	`
 
-	ids := []int{}
+	allIds := []MailGroupIDs{}
 
 	rows, err := tx.Query(query, monitorID)
 	if err != nil {
-		return ids, fmt.Errorf("listMailGroupIDsByMonitorID.Query: %w", err)
+		return allIds, fmt.Errorf("listMailGroupIDsByMonitorID.Query: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var id int
-		err = rows.Scan(&id)
+		var ids MailGroupIDs
+		err = rows.Scan(&ids.ID, &ids.Slug)
 		if err != nil {
-			return ids, fmt.Errorf("listMailGroupIDsByMonitorID.Scan: %w", err)
+			return allIds, fmt.Errorf("listMailGroupIDsByMonitorID.Scan: %w", err)
 		}
 
-		ids = append(ids, id)
+		allIds = append(allIds, ids)
 	}
 
-	return ids, nil
+	return allIds, nil
 }
 
 type MailGroupMember struct {
@@ -12800,14 +14724,14 @@ func getMailGroupByID(tx *sql.Tx, id int) (MailGroup, error) {
 	return mailGroup, nil
 }
 
-func createMailGroup(tx *sql.Tx, name string, description string) (int, error) {
+func createMailGroup(tx *sql.Tx, slug string, name string, description string) (int, error) {
 	const query = `
-		insert into mail_group(name, description) values(?, ?) returning id
+		insert into mail_group(slug, name, description) values(?, ?, ?) returning id
 	`
 
 	var id int
 
-	err := tx.QueryRow(query, name, description).Scan(&id)
+	err := tx.QueryRow(query, slug, name, description).Scan(&id)
 	if err != nil {
 		return id, fmt.Errorf("createMailGroup.QueryRow: %w", err)
 	}
@@ -12826,6 +14750,21 @@ func updateMailGroup(tx *sql.Tx, id int, name string, description string) error 
 	}
 
 	return nil
+}
+
+func updateMailGroupSlug(tx *sql.Tx, old string, new string) (int, error) {
+	const query = `
+		update mail_group set slug = ? where slug = ? returning id
+	`
+
+	var id int
+
+	err := tx.QueryRow(query, new, old).Scan(&id)
+	if err != nil {
+		return id, fmt.Errorf("updateMailGroupSlug.QueryRow: %w", err)
+	}
+
+	return id, nil
 }
 
 func updateMailGroupMembers(tx *sql.Tx, id int, members []string) error {
@@ -12871,6 +14810,11 @@ func updateMailGroupMembers(tx *sql.Tx, id int, members []string) error {
 }
 
 func postCreateMailGroup(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	name := r.PostFormValue("name")
 	if name == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -12897,7 +14841,19 @@ func postCreateMailGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	id, err := createMailGroup(tx, name, description)
+	mailGroups, err := listMailGroups(tx)
+	if err != nil {
+		log.Printf("postCreateMailGroup.listMailGroups: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	mailGroupSlugs := map[string]bool{}
+	for _, v := range mailGroups {
+		mailGroupSlugs[v.Slug] = true
+	}
+
+	id, err := createMailGroup(tx, generateSlug(name, mailGroupSlugs), name, description)
 	if err != nil {
 		log.Printf("postCreateMailGroup.createMailGroup: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -12967,6 +14923,11 @@ func deleteMailGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func postEditMailGroup(w http.ResponseWriter, r *http.Request) {
+	if metaConfigFileEnabled {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -13448,6 +15409,105 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	configFileEnabledStr, err := getMetaValue(tx, "configFileEnabled")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getSettings.getMetaValueConfigFileEnabled: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	configFileEnabled := false
+	if configFileEnabledStr != "" {
+		configFileEnabled, err = strconv.ParseBool(configFileEnabledStr)
+		if err != nil {
+			log.Printf("getSettings.ParseBoolConfigFileEnabled: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	configFile := ""
+	if configFileEnabled {
+		cfg, err := getMetaValue(tx, "configFile")
+		if err != nil {
+			log.Printf("getSettings.getMetaValueConfigFile: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		configFile = cfg
+	}
+
+	githubManagedConfigStr, err := getMetaValue(tx, "githubManagedConfig")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getSettings.getMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubManagedConfig := false
+	if githubManagedConfigStr != "" {
+		githubManagedConfig, err = strconv.ParseBool(githubManagedConfigStr)
+		if err != nil {
+			log.Printf("getSettings.ParseBoolGitHubManagedConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	githubConfigSHA := ""
+	githubRepoURL := ""
+	githubConfigPath := ""
+	githubConfigBranch := ""
+	githubConfigErrors := []string{}
+	if githubManagedConfig {
+		githubConfigSHA, err = getMetaValue(tx, "githubConfigSHA")
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("getSettings.getMetaValueGitHubConfigSHA: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if githubConfigSHA != "" {
+			githubConfigSHA = githubConfigSHA[0:7]
+		}
+
+		githubRepoURL, err = getMetaValue(tx, "githubRepoURL")
+		if err != nil {
+			log.Printf("getSettings.getMetaValueGitHubRepoURL: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		githubConfigPath, err = getMetaValue(tx, "githubConfigPath")
+		if err != nil {
+			log.Printf("getSettings.getMetaValueGitHubConfigPath: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		githubConfigBranch, err = getMetaValue(tx, "githubConfigBranch")
+		if err != nil {
+			log.Printf("getSettings.getMetaValueGitHubConfigBranch: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	githubConfigErrorsStr, err := getMetaValue(tx, "githubConfigErrors")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getSettings.getMetaValueGitHubConfigErrors: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if githubConfigErrorsStr != "" {
+		err = json.Unmarshal([]byte(githubConfigErrorsStr), &githubConfigErrors)
+		if err != nil {
+			log.Printf("getSettings.UnmarshalGitHubConfigErrors: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
 	err = tx.Commit()
 	if err != nil {
 		log.Printf("getSettings.Commit: %s", err)
@@ -13496,16 +15556,18 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 						<div class="edit-row">
 							<input id="name" name="name" value="{{.Ctx.Name}}" disabled>
 
-							<button 
-								type="button"
-								class="edit-button"
-								onclick="document.querySelector('#name').disabled = false;"
-							>
-								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
-									<path d="M13.488 2.513a1.75 1.75 0 0 0-2.475 0L6.75 6.774a2.75 2.75 0 0 0-.596.892l-.848 2.047a.75.75 0 0 0 .98.98l2.047-.848a2.75 2.75 0 0 0 .892-.596l4.261-4.262a1.75 1.75 0 0 0 0-2.474Z" />
-									<path d="M4.75 3.5c-.69 0-1.25.56-1.25 1.25v6.5c0 .69.56 1.25 1.25 1.25h6.5c.69 0 1.25-.56 1.25-1.25V9A.75.75 0 0 1 14 9v2.25A2.75 2.75 0 0 1 11.25 14h-6.5A2.75 2.75 0 0 1 2 11.25v-6.5A2.75 2.75 0 0 1 4.75 2H7a.75.75 0 0 1 0 1.5H4.75Z" />
-								</svg>
-							</button>
+							{{if not .Ctx.ConfigFile}}
+								<button 
+									type="button"
+									class="edit-button"
+									onclick="document.querySelector('#name').disabled = false;"
+								>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+										<path d="M13.488 2.513a1.75 1.75 0 0 0-2.475 0L6.75 6.774a2.75 2.75 0 0 0-.596.892l-.848 2.047a.75.75 0 0 0 .98.98l2.047-.848a2.75 2.75 0 0 0 .892-.596l4.261-4.262a1.75 1.75 0 0 0 0-2.474Z" />
+										<path d="M4.75 3.5c-.69 0-1.25.56-1.25 1.25v6.5c0 .69.56 1.25 1.25 1.25h6.5c.69 0 1.25-.56 1.25-1.25V9A.75.75 0 0 1 14 9v2.25A2.75 2.75 0 0 1 11.25 14h-6.5A2.75 2.75 0 0 1 2 11.25v-6.5A2.75 2.75 0 0 1 4.75 2H7a.75.75 0 0 1 0 1.5H4.75Z" />
+									</svg>
+								</button>
+							{{end}}
 
 							<button class="confirm-button">
 								Confirm
@@ -13743,6 +15805,205 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 						</script>
 					{{end}}
 				</div>
+
+				<div class="settings-users-header">
+					<h3>Configuration</h3>
+					<div>
+						{{if and .GitHubManagedConfig .GitHubConfigSHA}}
+							<div class="settings-users-header__git">
+								{{if .GitHubConfigErrors}}
+									<svg style="color: #F35846;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm2.78-4.22a.75.75 0 0 1-1.06 0L8 9.06l-1.72 1.72a.75.75 0 1 1-1.06-1.06L6.94 8 5.22 6.28a.75.75 0 0 1 1.06-1.06L8 6.94l1.72-1.72a.75.75 0 1 1 1.06 1.06L9.06 8l1.72 1.72a.75.75 0 0 1 0 1.06Z" clip-rule="evenodd" />
+									</svg>
+								{{else}}
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.844-8.791a.75.75 0 0 0-1.188-.918l-3.7 4.79-1.649-1.833a.75.75 0 1 0-1.114 1.004l2.25 2.5a.75.75 0 0 0 1.15-.043l4.25-5.5Z" clip-rule="evenodd" />
+									</svg>
+								{{end}}
+								<a href="{{.GitHubCommitLink}}" target="_blank">{{.GitHubConfigSHA}}</a>
+							</div>
+						{{end}}
+						<div class="menu">
+							<button type="button" class="menu-button">
+								<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none">
+									<path d="M5.99961 1.80005C6.2383 1.80005 6.46722 1.89487 6.63601 2.06365C6.80479 2.23244 6.89961 2.46135 6.89961 2.70005C6.89961 2.93874 6.80479 3.16766 6.63601 3.33645C6.46722 3.50523 6.2383 3.60005 5.99961 3.60005C5.76091 3.60005 5.532 3.50523 5.36321 3.33645C5.19443 3.16766 5.09961 2.93874 5.09961 2.70005C5.09961 2.46135 5.19443 2.23244 5.36321 2.06365C5.532 1.89487 5.76091 1.80005 5.99961 1.80005ZM5.99961 5.10005C6.2383 5.10005 6.46722 5.19487 6.63601 5.36365C6.80479 5.53244 6.89961 5.76135 6.89961 6.00005C6.89961 6.23874 6.80479 6.46766 6.63601 6.63645C6.46722 6.80523 6.2383 6.90005 5.99961 6.90005C5.76091 6.90005 5.532 6.80523 5.36321 6.63645C5.19443 6.46766 5.09961 6.23874 5.09961 6.00005C5.09961 5.76135 5.19443 5.53244 5.36321 5.36365C5.532 5.19487 5.76091 5.10005 5.99961 5.10005ZM6.89961 9.30005C6.89961 9.06135 6.80479 8.83244 6.63601 8.66365C6.46722 8.49487 6.2383 8.40005 5.99961 8.40005C5.76091 8.40005 5.532 8.49487 5.36321 8.66365C5.19443 8.83244 5.09961 9.06135 5.09961 9.30005C5.09961 9.53874 5.19443 9.76766 5.36321 9.93645C5.532 10.1052 5.76091 10.2 5.99961 10.2C6.2383 10.2 6.46722 10.1052 6.63601 9.93645C6.80479 9.76766 6.89961 9.53874 6.89961 9.30005Z" fill="#595959"/>
+								</svg>
+							</button>
+
+							<dialog>
+								<a href="/admin/settings/config-settings" hx-boost="true">Settings</a>
+								{{if .ConfigFile}}
+									<button onclick="document.getElementById('secrets-dialog').showModal();">Secrets</button>
+								{{end}}
+							</dialog>
+						</div>
+					</div>
+				</div>
+				{{if .ConfigFileEnabled}}
+					<form id="config-form" hx-post="/admin/settings/config" hx-swap="none">		
+						<div id="editor-container" style="width: 100%; height: 800px; margin-top: 1.0rem; position: relative;">
+							<div id="save-overlay" class="save-overlay">
+								<span>Save changes</span>
+								<button>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+										<path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z" clip-rule="evenodd" />
+									</svg>
+								</button>
+							</div>
+							<div id="save-overlay-errors" class="save-overlay-errors">
+								{{range $error := .GitHubConfigErrors}}
+									<div class="save-overlay save-overlay--error">
+										{{$error}}
+									</div>
+								{{end}}
+							</div>
+						</div>
+						<input name="config" type="hidden" value="{{.ConfigFile}}" required>
+					</form>
+				{{else}}
+					<div class="entity-empty-state">
+						<div class="icon">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+								<path fill-rule="evenodd" d="M4.5 1.938a.75.75 0 0 1 1.025.274l.652 1.131c.351-.138.71-.233 1.073-.288V1.75a.75.75 0 0 1 1.5 0v1.306a5.03 5.03 0 0 1 1.072.288l.654-1.132a.75.75 0 1 1 1.298.75l-.652 1.13c.286.23.55.492.785.786l1.13-.653a.75.75 0 1 1 .75 1.3l-1.13.652c.137.351.233.71.288 1.073h1.305a.75.75 0 0 1 0 1.5h-1.306a5.032 5.032 0 0 1-.288 1.072l1.132.654a.75.75 0 0 1-.75 1.298l-1.13-.652c-.23.286-.492.55-.786.785l.652 1.13a.75.75 0 0 1-1.298.75l-.653-1.13c-.351.137-.71.233-1.073.288v1.305a.75.75 0 0 1-1.5 0v-1.306a5.032 5.032 0 0 1-1.072-.288l-.653 1.132a.75.75 0 0 1-1.3-.75l.653-1.13a4.966 4.966 0 0 1-.785-.786l-1.13.652a.75.75 0 0 1-.75-1.298l1.13-.653a4.965 4.965 0 0 1-.288-1.073H1.75a.75.75 0 0 1 0-1.5h1.306a5.03 5.03 0 0 1 .288-1.072l-1.132-.653a.75.75 0 0 1 .75-1.3l1.13.653c.23-.286.492-.55.786-.785l-.653-1.13A.75.75 0 0 1 4.5 1.937Zm1.14 3.476a3.501 3.501 0 0 0 0 5.172L7.135 8 5.641 5.414ZM8.434 8.75 6.94 11.336a3.491 3.491 0 0 0 2.81-.305 3.49 3.49 0 0 0 1.669-2.281H8.433Zm2.987-1.5H8.433L6.94 4.664a3.501 3.501 0 0 1 4.48 2.586Z" clip-rule="evenodd" />
+							</svg>
+						</div>
+						<span>Your configuration is managed by Statusnook web UI forms</span>
+						<a class="action" href="/admin/settings/config-settings" hx-boost="true">Switch to text based</a>
+					</div>
+				{{end}}
+
+				<dialog class="modal secrets-modal" id="secrets-dialog" onclose="onCloseDialog(this);">
+					<div>
+						<span>Secrets</span>
+						<button onclick="document.getElementById('secrets-dialog').close();">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+								<path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" />
+							</svg>
+						</button>
+					</div>
+					<form 
+						hx-post="/admin/settings/secrets"
+						hx-swap="none"
+						autocomplete="off"
+					>
+						<div class="secrets-modal__input">
+							<input name="input" placeholder="Input" required>
+							<div>
+								<input id="output" placeholder="Output" disabled>
+								<button type="button" onclick="copyOutput(this);">
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path d="M5.5 3.5A1.5 1.5 0 0 1 7 2h2.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 1 .439 1.061V9.5A1.5 1.5 0 0 1 12 11V8.621a3 3 0 0 0-.879-2.121L9 4.379A3 3 0 0 0 6.879 3.5H5.5Z" />
+										<path d="M4 5a1.5 1.5 0 0 0-1.5 1.5v6A1.5 1.5 0 0 0 4 14h5a1.5 1.5 0 0 0 1.5-1.5V8.621a1.5 1.5 0 0 0-.44-1.06L7.94 5.439A1.5 1.5 0 0 0 6.878 5H4Z" />
+									</svg>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M12.416 3.376a.75.75 0 0 1 .208 1.04l-5 7.5a.75.75 0 0 1-1.154.114l-3-3a.75.75 0 0 1 1.06-1.06l2.353 2.353 4.493-6.74a.75.75 0 0 1 1.04-.207Z" clip-rule="evenodd" />
+									</svg>
+								</button>
+							</div>
+						</div>
+
+						<div>
+							<button name="action" value="encrypt">Encrypt</button>
+							<button name="action" value="decrypt">Decrypt</button>
+						</div>
+					</form>
+				</dialog>	
+
+				{{if .ConfigFileEnabled}}
+					<link
+						rel="stylesheet"
+						data-name="vs/editor/editor.main"
+						href="/static/monaco-editor/min/vs/editor/editor.main.css"
+					/>
+
+					<script>
+						var require = { paths: { vs: '/static/monaco-editor/min/vs' } };
+					</script>
+				{{end}}
+
+
+				<script>
+					function copyOutput(e) {
+						if (e.form.elements.output.value === "") {
+							return;
+						}
+
+						navigator.clipboard.writeText(e.form.elements.output.value);
+						e.classList.add("copy-success");
+		
+						setTimeout(() => {
+							e.classList.remove("copy-success");
+						}, 1000);
+					}
+
+					function onCloseDialog(e) {
+						[...e.querySelectorAll("form input")].forEach((v) => {
+							v.value = "";
+						});
+					}
+
+					{{if .ConfigFileEnabled}}
+						(async () => {
+							function addScript(url) {
+								return new Promise((resolve, reject) => {
+									const script = document.createElement('script');
+									script.onload = () => {
+										resolve();
+									};
+									script.onerror = reject;
+									script.src = url;
+									document.body.appendChild(script);
+								});
+							}
+
+							if (window.monaco) {
+								window.monaco.editor.getModels().forEach(model => model.dispose());
+								initEditor();
+							}
+
+							function initEditor() {
+								configFile = "{{.ConfigFile}}";
+
+								const editor = monaco.editor.create(document.getElementById("editor-container"), {
+									language: 'yaml',
+									fontSize: 16,
+									theme: "vs-dark",
+									minimap: {enabled: false},
+									overviewRulerLanes: 0,
+									padding: {top: 24},
+									automaticLayout: true,
+									value: configFile,
+									{{if .GitHubManagedConfig}}readOnly: true,{{end}}
+								});	
+																	
+								editor.getModel().onDidChangeContent((event) => {
+									const configForm = document.querySelector("#config-form");
+									
+									const value = editor.getModel().getValue();
+
+									configForm.elements["config"].value = value;
+
+									const saveOverlay = configForm.querySelector("#save-overlay");
+									
+									if (value === configFile) {
+										saveOverlay.style.display = "none";
+									} else {
+										saveOverlay.style.display = "flex";
+									}
+								});
+							}
+
+							if (!window.monaco) {
+								await addScript("/static/monaco-editor/min/vs/loader.js");
+								await addScript("/static/monaco-editor/min/vs/editor/editor.main.nls.js");
+								await addScript("/static/monaco-editor/min/vs/editor/editor.main.js");
+								initEditor();
+							}
+						})();
+					{{end}}
+				</script>
+
+				<div id="update-config"></div>
 			</div>
 		{{end}}
 	`
@@ -13757,19 +16018,32 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 	err = tmpl.Execute(
 		w,
 		struct {
-			CurrentVersion string
-			Domain         string
-			Users          []SettingsUser
-			Invitations    []FormattedInvitation
-			Refresh        bool
-			Ctx            pageCtx
+			CurrentVersion      string
+			Domain              string
+			Users               []SettingsUser
+			Invitations         []FormattedInvitation
+			Refresh             bool
+			ConfigFileEnabled   bool
+			ConfigFile          string
+			GitHubManagedConfig bool
+			GitHubConfigSHA     string
+			GitHubCommitLink    string
+			GitHubConfigErrors  []string
+			Ctx                 pageCtx
 		}{
-			CurrentVersion: VERSION,
-			Domain:         metaDomain,
-			Users:          users,
-			Invitations:    formattedInvitations,
-			Refresh:        refresh,
-			Ctx:            getPageCtx(r),
+			CurrentVersion:      VERSION,
+			Domain:              metaDomain,
+			Users:               users,
+			Invitations:         formattedInvitations,
+			Refresh:             refresh,
+			ConfigFileEnabled:   configFileEnabled,
+			ConfigFile:          configFile,
+			GitHubManagedConfig: githubManagedConfig,
+			GitHubConfigSHA:     githubConfigSHA,
+			GitHubCommitLink: githubRepoURL + "/blob/" + githubConfigBranch + "/" +
+				githubConfigPath,
+			GitHubConfigErrors: githubConfigErrors,
+			Ctx:                getPageCtx(r),
 		},
 	)
 	if err != nil {
@@ -13784,6 +16058,11 @@ func postSettings(w http.ResponseWriter, r *http.Request) {
 	domain := strings.ToLower(r.PostFormValue("domain"))
 
 	if name != "" {
+		if metaConfigFileEnabled {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
 		tx, err := rwDB.Begin()
 		if err != nil {
 			log.Printf("postSettings.BeginName: %s", err)
@@ -14598,6 +16877,1232 @@ func postDeleteInvite(w http.ResponseWriter, r *http.Request) {
 		log.Printf("postDeleteInvite.Commit: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
+	}
+}
+
+func getConfigSettings(w http.ResponseWriter, r *http.Request) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("getConfigSettings.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	configFileStr, err := getMetaValue(tx, "configFileEnabled")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueConfigFileEnabled: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	configFile := false
+	if configFileStr != "" {
+		configFile, err = strconv.ParseBool(configFileStr)
+		if err != nil {
+			log.Printf("getConfigSettings.ParseBoolConfigFile: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	githubManagedConfigStr, err := getMetaValue(tx, "githubManagedConfig")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	githubManagedConfig := false
+	if githubManagedConfigStr != "" {
+		githubManagedConfig, err = strconv.ParseBool(githubManagedConfigStr)
+		if err != nil {
+			log.Printf("getConfigSettings.ParseBoolGitHubManagedConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	githubRepoURL, err := getMetaValue(tx, "githubRepoURL")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubRepoURL %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubBranch, err := getMetaValue(tx, "githubConfigBranch")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubConfigBranch %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubFilePath, err := getMetaValue(tx, "githubConfigPath")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubConfigPath %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubToken, err := getMetaValue(tx, "githubConfigToken")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubConfigToken %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubWebhookSecret, err := getMetaValue(tx, "githubConfigWebhookSecret")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getConfigSettings.getMetaValueGitHubConfigWebhookSecret %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("getConfigSettings.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	const markup = `
+		{{define "title"}}Configuration settings{{end}}
+		{{define "body"}}
+			<div class="create-service-container">
+				<div class="admin-nav-header">
+					<div>
+						<a href="/admin/settings" hx-boost="true">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
+							</svg>
+						</a>
+				
+						<h2>Configuration settings</h2>
+					</div>
+				</div>
+
+				<p style="font-size: 1.6rem; margin-bottom: 4.6rem;">
+					Configure how your Statusnook configuration is managed
+				</p>
+				
+				<form hx-post hx-swap="none" autocomplete="off">
+					<label>
+						Text-based config				
+						<span class="subtext">
+							Enable to configure monitors, services, and notifications via YAML rather than web UI forms
+						</span>
+					</label>
+
+					<div class="checkbox-group">
+						<label>
+							<input 
+								name="config-file"
+								type="checkbox"
+								onchange="toggleConfig(this);"
+								{{if .ConfigFile}}checked{{end}}
+							/>
+						</label>
+					</div>
+
+					<label>
+						GitHub managed config
+						<span class="subtext">
+							Enable to manage your configuration via GitHub
+						</span>
+					</label>
+
+
+					<div class="checkbox-group">
+						<label>
+							<input
+								name="github-managed"
+								type="checkbox"
+								onchange="toggleGitHub(this);"
+								{{if .GitHubManagedConfig}}
+									data-previous-value="true"
+									checked
+								{{end}}
+								{{if not .ConfigFile}}
+									disabled
+								{{end}}
+							/>
+						</label>
+					</div>
+
+					<script>
+						function toggleConfig(e) {
+							const githubManaged = e.form.elements["github-managed"];
+
+							if (!e.checked) {
+								githubManaged.checked = false;
+								githubManaged.disabled = true;
+								toggleGitHub(githubManaged, true);					
+							} else {
+								githubManaged.disabled = false;
+								githubManaged.checked = 
+									githubManaged.dataset.previousValue === "true" ? "true" : false;	
+								toggleGitHub(githubManaged, true);						
+							}
+						}
+
+						function toggleGitHub(e, indirect) {
+							const githubConfig = document.getElementById("github-config");
+
+							if (!indirect) {
+								e.dataset.previousValue = e.checked;
+							}
+							if (e.checked) {
+								githubConfig.disabled = false;
+							} else {
+								githubConfig.disabled = true;
+							}
+						}
+					</script>
+						
+					<fieldset 
+						id="github-config" 
+						class="github-config"
+						{{if not .GitHubManagedConfig}}disabled{{end}}
+					>
+						<hr style="border: 1px solid #F6F6F6; margin-top: 0; margin-bottom: 3.6rem;">
+						<div id="alert" class="alert"></div>
+						<label>
+							GitHub repository
+							<span class="subtext">
+								Enter a repository URL and a branch
+							</span>
+							<div style="display: flex; gap: 1.0rem;">
+								<input 
+									style="flex: 3;"
+									name="github-repo-url"
+									type="url"
+									placeholder="Repo URL (https://github.com/example/example)"
+									value="{{.GitHubRepoURL}}"
+									required
+								>
+
+								<input
+									style="flex: 1;" 
+									name="github-branch"
+									placeholder="Branch (main)"
+									value="{{.GitHubConfigBranch}}"
+									required
+								>
+							</div>
+						</label>
+
+						<label>
+							Config path 
+							<span class="subtext">
+								Enter a path relative to the root of the repository
+							</span>
+							<input
+								name="github-config-path"
+								placeholder="Path (example-directory/config.yaml)"
+								value="{{.GitHubConfigPath}}" required
+							>
+						</label>
+
+
+						<label>
+							GitHub personal access token 
+							<span class="subtext">
+								Paste a personal access token with Contents read-only permission
+							</span>
+							<input name="github-token" type="password" value="{{.GitHubToken}}" required>
+						</label>
+
+						<label>
+							Webhook secret
+							<span class="subtext">
+								Add this secret to your GitHub webhook
+							</span>
+							<div
+								id="github-webhook-secret-container"
+								class="github-webhook-secret-container"
+							>
+								<input 
+									id="github-webhook-secret"
+									name="github-webhook-secret"
+									type="password"
+									value="{{.GitHubWebhookSecret}}"
+									required
+								>
+								<button 
+									type="button"
+									onclick="togglePw(this);"
+								>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />
+										<path fill-rule="evenodd" d="M1.38 8.28a.87.87 0 0 1 0-.566 7.003 7.003 0 0 1 13.238.006.87.87 0 0 1 0 .566A7.003 7.003 0 0 1 1.379 8.28ZM11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clip-rule="evenodd" />
+									</svg>
+									<svg style="display: none;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M3.28 2.22a.75.75 0 0 0-1.06 1.06l10.5 10.5a.75.75 0 1 0 1.06-1.06l-1.322-1.323a7.012 7.012 0 0 0 2.16-3.11.87.87 0 0 0 0-.567A7.003 7.003 0 0 0 4.82 3.76l-1.54-1.54Zm3.196 3.195 1.135 1.136A1.502 1.502 0 0 1 9.45 8.389l1.136 1.135a3 3 0 0 0-4.109-4.109Z" clip-rule="evenodd" />
+										<path d="m7.812 10.994 1.816 1.816A7.003 7.003 0 0 1 1.38 8.28a.87.87 0 0 1 0-.566 6.985 6.985 0 0 1 1.113-2.039l2.513 2.513a3 3 0 0 0 2.806 2.806Z" />
+									</svg>
+								</button>
+								<script>
+									function togglePw(el) {
+										const input = el.form.elements['github-webhook-secret'];
+										if (input.type === "text") {
+											input.type = "password";
+											el.querySelectorAll("svg")[0].style.display = "flex";
+											el.querySelectorAll("svg")[1].style.display = "none";
+										} else if (input.type === "password") {
+											input.type = "text";
+											el.querySelectorAll("svg")[0].style.display = "none";
+											el.querySelectorAll("svg")[1].style.display = "flex";
+										}
+									}
+
+									function copySecret(el) {
+										navigator.clipboard.writeText(el.form.elements['github-webhook-secret'].value)
+										el.querySelectorAll("svg")[0].style.display = "none";
+										el.querySelectorAll("svg")[1].style.display = "flex";
+										setTimeout(() => {
+											el.querySelectorAll("svg")[0].style.display = "flex";
+											el.querySelectorAll("svg")[1].style.display = "none";
+										}, 1000);
+									}
+								</script>
+
+								<button 
+									type="button"
+									onclick="document.getElementById('generate-new-webhook-secret').showModal();"
+								>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-4">
+										<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
+									</svg>
+									<span style="margin-left: 0.6rem;">Generate</span>
+								</button>
+							
+								<button 
+									type="button" 
+									onclick="copySecret(this);"
+								>
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-4">
+										<path d="M5.5 3.5A1.5 1.5 0 0 1 7 2h2.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 1 .439 1.061V9.5A1.5 1.5 0 0 1 12 11V8.621a3 3 0 0 0-.879-2.121L9 4.379A3 3 0 0 0 6.879 3.5H5.5Z" />
+										<path d="M4 5a1.5 1.5 0 0 0-1.5 1.5v6A1.5 1.5 0 0 0 4 14h5a1.5 1.5 0 0 0 1.5-1.5V8.621a1.5 1.5 0 0 0-.44-1.06L7.94 5.439A1.5 1.5 0 0 0 6.878 5H4Z" />
+									</svg>
+									<svg style="display: none;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-4">
+										<path fill-rule="evenodd" d="M12.416 3.376a.75.75 0 0 1 .208 1.04l-5 7.5a.75.75 0 0 1-1.154.114l-3-3a.75.75 0 0 1 1.06-1.06l2.353 2.353 4.493-6.74a.75.75 0 0 1 1.04-.207Z" clip-rule="evenodd" />
+									</svg>
+								</button>
+							</div>
+						</label>
+
+						<div class="slack-container" style="display: block;">
+							<a 
+								class="help"
+								href="https://github.com/settings/personal-access-tokens/new"
+								target="_blank"
+							>
+								Go to create a personal access token
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+									<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+								</svg>
+
+							</a>
+
+							<button 
+								type="button"
+								class="help"
+								onclick="document.querySelector('.slack-tutorial').classList.toggle('slack-tutorial--visible');"
+							>
+								How do I create a personal access token?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</button>
+
+							<div class="slack-tutorial">
+								<a href="https://github.com/settings/personal-access-tokens/new" target="_blank">
+									<svg viewBox="0 0 98 96" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z" fill="#171515"/></svg>
+									Create PAT
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+										<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+										<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+									</svg>
+								</a>
+
+								<p>Name your token</p>
+								<p>
+									Set a token expiration, the maximum is 1 year into the future
+								</p> 
+
+								<p>
+									Scope the token to the repository containing your Statusnook configuration
+								</p> 
+								<img 
+									src="/static/images/github-pat-tutorial/1.png"
+									style="width: 100%;"
+								/>
+
+								<p>Under "Repository permissions" read-only "Contents" access</p>
+								<img 
+									src="/static/images/github-pat-tutorial/2.png"
+									style="width: 100%;"
+								/>
+
+								<p>Finally, select "Generate token"</p>
+							</div>
+
+							<button 
+								type="button"
+								class="help"
+								onclick="document.querySelector('.slack-tutorial-app').classList.toggle('slack-tutorial-app--visible');"
+							>
+								How do I create a repository webhook?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</button>
+
+							<div class="slack-tutorial-app">
+								<p>On your GitHub repository navigate to Settings > Webhooks</p>
+								
+								<p>Select "Add webhook"</p>
+
+								<p>Enter the following payload URL: https://{{.Ctx.Domain}}/github-config-webhook</p>
+
+								<p>Enter your webhook secret from Statusnook</p>
+
+								<img
+									src="/static/images/github-webhook-tutorial/1.png"
+									style="width: 100%;"
+								/>
+							</div>
+						</div>
+					</fieldset>
+					
+					<div>
+						<button type="submit">Confirm</button>
+					</div>
+				</form>
+
+				<dialog class="modal generate-new-webhook-secret" id="generate-new-webhook-secret">
+					<span>Generate new webhook secret</span>
+					<span>
+						Ensure you update your webhook secret on GitHub if you confirm these configuration changes
+					</span>
+					<form 
+						hx-post="/admin/settings/config-settings/generate-webhook-secret"
+						hx-target="#github-webhook-secret-container"
+						hx-swap="beforeend"
+					>
+						<div>
+							<button onclick="document.getElementById('generate-new-webhook-secret').close(); return false;">Cancel</button>
+							<button>Ok - dismiss</button>
+						</div>
+					</form>
+				</dialog>
+			</div>
+		{{end}}
+	`
+
+	tmpl, err := parseTmpl("getConfigSettings", markup)
+	if err != nil {
+		log.Printf("getConfigSettings.parseTmpl: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tmpl.Execute(w, struct {
+		ConfigFile          bool
+		GitHubManagedConfig bool
+		GitHubRepoURL       string
+		GitHubConfigBranch  string
+		GitHubConfigPath    string
+		GitHubToken         string
+		GitHubWebhookSecret string
+		Domain              string
+		Ctx                 pageCtx
+	}{
+		ConfigFile:          configFile,
+		GitHubManagedConfig: githubManagedConfig,
+		GitHubRepoURL:       githubRepoURL,
+		GitHubConfigBranch:  githubBranch,
+		GitHubConfigPath:    githubFilePath,
+		GitHubToken:         githubToken,
+		GitHubWebhookSecret: githubWebhookSecret,
+		Domain:              metaDomain,
+		Ctx:                 getPageCtx(r),
+	})
+	if err != nil {
+		log.Printf("getConfigSettings.Execute: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func postConfigSettings(w http.ResponseWriter, r *http.Request) {
+	configFile := r.PostFormValue("config-file") == "on"
+	githubManaged := r.PostFormValue("github-managed") == "on"
+
+	githubRepoURL := strings.TrimSuffix(r.PostFormValue("github-repo-url"), "/")
+	githubBranch := r.PostFormValue("github-branch")
+	githubConfigPath := r.PostFormValue("github-config-path")
+	githubToken := r.PostFormValue("github-token")
+	githubWebhookSecret := r.PostFormValue("github-webhook-secret")
+
+	if !configFile && githubManaged {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if githubManaged {
+		if githubRepoURL == "" || githubBranch == "" || githubConfigPath == "" ||
+			githubToken == "" || githubWebhookSecret == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postConfigSettings.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	err = updateMetaValue(tx, "configFileEnabled", strconv.FormatBool(configFile))
+	if err != nil {
+		log.Printf("postConfigSettings.updateMetaValueConfigFileEnabled: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = updateMetaValue(tx, "githubManagedConfig", strconv.FormatBool(githubManaged))
+	if err != nil {
+		log.Printf("postConfigSettings.updateMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if githubManaged {
+		parsedRepoURL, err := url.Parse(githubRepoURL)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`<div id="alert" class="alert" hx-swap-oob="true">Invalid repo url</div>`))
+			return
+		}
+
+		if parsedRepoURL.Path == "" {
+			w.Write([]byte(`
+				<div id="alert" class="alert" hx-swap-oob="true">
+					Invalid GitHub repository URL
+				</div>`,
+			))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		repoPath := parsedRepoURL.Path[1:]
+
+		httpClient := http.Client{
+			Timeout: time.Second * 10,
+		}
+
+		req, err := http.NewRequest(
+			http.MethodGet,
+			"https://api.github.com/repos/"+repoPath,
+			nil,
+		)
+		if err != nil {
+			log.Printf("postConfigSettings.NewRequestRepo: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(
+				`<div id="alert" class="alert" hx-swap-oob="true">An unexpected error occurred</div>`,
+			))
+			return
+		}
+		req.Header.Add("Accept", "application/vnd.github+json")
+		req.Header.Add("Authorization", "Bearer "+githubToken)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("postConfigSettings.DoRepo: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(
+				`<div id="alert" class="alert" hx-swap-oob="true">An unexpected error occurred</div>`,
+			))
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("postConfigSettings.ReadAllNon200Repo: %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`<div id="alert" class="alert" hx-swap-oob="true">An error occurred when checking for your config</div>`))
+			return
+		}
+
+		if resp.StatusCode != 200 {
+			if string(respBody) != "" {
+				log.Printf("postConfigSettings.StatusCodeRepo: %s", string(respBody))
+			}
+
+			w.WriteHeader(http.StatusBadRequest)
+			if resp.StatusCode == 404 {
+				w.Write([]byte(`
+					<div id="alert" class="alert" hx-swap-oob="true">
+						Your GitHub repository could not be found.
+						Please double-check your repository URL and token permissions, then try again
+					</div>`,
+				))
+			} else if resp.StatusCode == 401 {
+				w.Write([]byte(
+					`<div id="alert" class="alert" hx-swap-oob="true">
+						There's an issue with your personal access token. 
+						Please double-check your personal access token, then try again
+					</div>`,
+				))
+
+			}
+			return
+		}
+
+		req, err = http.NewRequest(
+			http.MethodGet,
+			"https://api.github.com/repos/"+path.Join(repoPath, "contents", githubConfigPath)+"?ref="+
+				githubBranch,
+			nil,
+		)
+		if err != nil {
+			log.Printf("postConfigSettings.NewRequestConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(
+				`<div id="alert" class="alert" hx-swap-oob="true">An unexpected error occurred</div>`,
+			))
+			return
+		}
+		req.Header.Add("Accept", "application/vnd.github+json")
+		req.Header.Add("Authorization", "Bearer "+githubToken)
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			log.Printf("postConfigSettings.DoConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(
+				`<div id="alert" class="alert" hx-swap-oob="true">An unexpected error occurred</div>`,
+			))
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("postConfigSettings.ReadAllNon200Config: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(
+				`<div id="alert" class="alert" hx-swap-oob="true">
+					An unexpected error occurred
+				</div>`,
+			))
+			return
+		}
+
+		if resp.StatusCode != 200 {
+			if string(respBody) != "" {
+				log.Printf("postConfigSettings.StatusCodeConfig: %s", string(respBody))
+			}
+
+			w.WriteHeader(http.StatusBadRequest)
+			if resp.StatusCode == 404 {
+				w.Write([]byte(`
+					<div id="alert" class="alert" hx-swap-oob="true">
+						Your Statusnook configuration could not be found.
+						Please double-check the path and branch, then try again.
+					</div>`,
+				))
+			} else {
+				w.Write([]byte(`
+					<div id="alert" class="alert" hx-swap-oob="true">
+						Your Statusnook configuration could not be found. An unexpcted error occurred.
+					</div>`,
+				))
+			}
+			return
+		}
+
+		err = updateMetaValue(tx, "githubRepoURL", githubRepoURL)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigBranch: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "githubConfigBranch", githubBranch)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigBranch: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "githubConfigPath", githubConfigPath)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigPath: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "githubConfigToken", githubToken)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigToken: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "githubConfigWebhookSecret", githubWebhookSecret)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigWebhookSecret: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if !githubManaged {
+		err = updateMetaValue(tx, "githubConfigSHA", "")
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueGitHubConfigSHA: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if !metaConfigFileEnabled && configFile {
+		cfg, err := generateConfig(tx)
+		if err != nil {
+			log.Printf("postConfigSettings.generateConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "configFile", cfg)
+		if err != nil {
+			log.Printf("postConfigSettings.updateMetaValueConfigFile: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postConfigSettings.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	metaConfigFileEnabled = configFile
+
+	w.Header().Add("HX-Location", "/admin/settings")
+}
+
+func postGenerateWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	tokenBytes := make([]byte, 32)
+	_, err := rand.Read(tokenBytes)
+	if err != nil {
+		log.Printf("postGenerateWebhookSecret.Read: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	token := base64.StdEncoding.EncodeToString(tokenBytes)
+
+	w.Write(
+		[]byte(fmt.Sprintf(
+			`<input 
+				id="github-webhook-secret"
+				name="github-webhook-secret"
+				type="password"
+				readonly="true"
+				value="%s"
+				hx-swap-oob="true"
+			>
+			
+			<script>
+				document.getElementById("generate-new-webhook-secret").close();
+			</script>`,
+			token,
+		)),
+	)
+}
+
+func configWebhook(w http.ResponseWriter, r *http.Request) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("configWebhook.BeginRead: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	githubManagedConfig, err := getMetaValue(tx, "githubManagedConfig")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if githubManagedConfig != "true" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	sig := r.Header.Get("X-Hub-Signature-256")
+	if !strings.HasPrefix(sig, "sha256=") {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	sig = strings.TrimPrefix(sig, "sha256=")
+
+	key, err := getMetaValue(tx, "githubConfigWebhookSecret")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubWebhookSecret: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	repoURL, err := getMetaValue(tx, "githubRepoURL")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubRepoURL: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	branch, err := getMetaValue(tx, "githubConfigBranch")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubConfigBranch: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	configPath, err := getMetaValue(tx, "githubConfigPath")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubConfigPath: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	token, err := getMetaValue(tx, "githubConfigToken")
+	if err != nil {
+		log.Printf("configWebhook.getMetaValueGitHubConfigToken: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	configSHA, err := getMetaValue(tx, "githubConfigSHA")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("configWebhook.getMetaValueGitHubConfigSHA: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("configWebhook.ReadAll: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write(payload)
+	payloadMac := mac.Sum(nil)
+
+	headerMac, err := hex.DecodeString(sig)
+	if err != nil {
+		log.Printf("configWebhook.DecodeString: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if !hmac.Equal(headerMac, payloadMac) {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("configWebhook.CommitRead: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	parsedRepoURL, err := url.Parse(repoURL)
+	if err != nil {
+		log.Printf("configWebhook.Parse: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	repoPath := parsedRepoURL.Path[1:]
+
+	httpClient := http.Client{
+		Timeout: time.Second * 10,
+	}
+
+	req, err := http.NewRequest(
+		http.MethodGet,
+		"https://api.github.com/repos/"+path.Join(repoPath, "contents", configPath)+"?ref="+branch,
+		nil,
+	)
+	if err != nil {
+		log.Printf("configWebhook.NewRequest: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	req.Header.Add("Accept", "application/vnd.github+json")
+	req.Header.Add("Authorization", "Bearer "+token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("configWebhook.Do: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("configWebhook.ReadAllNon200: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if string(respBody) != "" {
+			log.Printf("configWebhook.StatusCode: %s", string(respBody))
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	type repositoryContentResponse struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+		SHA     string `json:"sha"`
+	}
+
+	var contentResp repositoryContentResponse
+
+	jsonDecoder := json.NewDecoder(resp.Body)
+	err = jsonDecoder.Decode(&contentResp)
+	if err != nil {
+		log.Printf("configWebhook.Decode: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	content, err := base64.StdEncoding.DecodeString(contentResp.Content)
+	if err != nil {
+		log.Printf("configWebhook.DecodeString: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	tx, err = rwDB.Begin()
+	if err != nil {
+		log.Printf("configWebhook.BeginWrite: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if contentResp.SHA != configSHA {
+		msgs, err := applyConfig(tx, content)
+		if err != nil {
+			unwrappedErr := errors.Unwrap(err)
+			if !strings.HasPrefix(unwrappedErr.Error(), "yaml:") {
+				log.Printf("configWebhook.applyConfig: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			msgs = append(msgs, strings.TrimPrefix(unwrappedErr.Error(), "yaml: "))
+		}
+
+		configErrors := ""
+
+		if len(msgs) > 0 {
+			msgsBytes, err := json.Marshal(msgs)
+			if err != nil {
+				log.Printf("configWebhook.Marshal: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			configErrors = string(msgsBytes)
+		}
+
+		err = updateMetaValue(tx, "githubConfigErrors", string(configErrors))
+		if err != nil {
+			log.Printf("configWebhook.updateMetaValueGitHubConfigErrors: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "configFile", string(content))
+		if err != nil {
+			log.Printf("configWebhook.updateMetaValueConfigFile: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = updateMetaValue(tx, "githubConfigSHA", contentResp.SHA)
+		if err != nil {
+			log.Printf("configWebhook.updateMetaValueGitHubConfigSHA: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	name, err := getMetaValue(tx, "name")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Fatalf("configWebhook.getMetaValueName: %s", err)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("configWebhook.CommitWrite: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	metaName = name
+}
+
+func postConfig(w http.ResponseWriter, r *http.Request) {
+	config := r.PostFormValue("config")
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postConfig.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	githubManagedConfigStr, err := getMetaValue(tx, "githubManagedConfig")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("postConfig.getMetaValueGitHubManagedConfig: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	githubManagedConfig := false
+	if githubManagedConfigStr != "" {
+		githubManagedConfig, err = strconv.ParseBool(githubManagedConfigStr)
+		if err != nil {
+			log.Printf("postConfig.ParseBoolGitHubManagedConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if githubManagedConfig {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	msgs, err := applyConfig(tx, []byte(config))
+	if err != nil {
+		unwrappedErr := errors.Unwrap(err)
+
+		if unwrappedErr == nil || !strings.HasPrefix(unwrappedErr.Error(), "yaml:") {
+			log.Printf("postConfig.applyConfig: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		formattedErr := strings.TrimPrefix(unwrappedErr.Error(), "yaml: ")
+
+		errMsg := fmt.Sprintf(
+			`<div class="save-overlay save-overlay--error">%s</div>`,
+			html.EscapeString(formattedErr),
+		)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(
+			[]byte(fmt.Sprintf(
+				`<div 
+					id="save-overlay-errors"
+					class="save-overlay-errors"
+					hx-swap-oob="true"
+				>
+					%s
+				</div>`,
+				errMsg,
+			)),
+		)
+		return
+	}
+
+	if len(msgs) > 0 {
+		errors := ""
+		for _, v := range msgs {
+			errors += fmt.Sprintf(
+				`<div class="save-overlay save-overlay--error">%s</div>`,
+				html.EscapeString(v),
+			)
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(
+			[]byte(fmt.Sprintf(
+				`<div id="save-overlay-errors" class="save-overlay-errors" hx-swap-oob="true">%s</div>`,
+				errors,
+			)),
+		)
+		return
+	}
+
+	err = updateMetaValue(tx, "githubConfigErrors", "")
+	if err != nil {
+		log.Printf("postConfig.updateMetaValueGitHubConfigErrors: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	name, err := getMetaValue(tx, "name")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Fatalf("postConfig.getMetaValueSetupName: %s", err)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postConfig.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	metaName = name
+
+	w.Write(
+		[]byte(
+			fmt.Sprintf(`
+			<div id="save-overlay-errors" class="save-overlay-errors" hx-swap-oob="true"></div>
+			<div id="update-config" hx-swap-oob="true">
+				<script>
+					document.querySelector("#save-overlay").style.display = "none";
+					window.configFile = "%s";
+				</script>
+			</div>
+			`,
+				template.JSEscapeString(config),
+			),
+		),
+	)
+}
+
+func postSecret(w http.ResponseWriter, r *http.Request) {
+	action := r.PostFormValue("action")
+	if action != "encrypt" && action != "decrypt" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	input := r.PostFormValue("input")
+	if input == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postSecret.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	key, err := getMetaValue(tx, "secretKey")
+	if err != nil {
+		log.Printf("postSecret.getMetaValue: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("postSecret.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	keyBytes, err := base64.StdEncoding.DecodeString(key)
+	if err != nil {
+		log.Printf("postSecret.DecodeString: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		log.Printf("postSecret.NewCipher: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		log.Printf("postSecret.NewGCM: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if action == "encrypt" {
+		nonce := make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			log.Printf("postSecret.ReadFull: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		ciphertext := aesGCM.Seal(nil, nonce, []byte(input), nil)
+
+		b64Ciphertext := base64.StdEncoding.EncodeToString(ciphertext) + "." +
+			base64.StdEncoding.EncodeToString(nonce)
+
+		w.Write(
+			[]byte(fmt.Sprintf(
+				`<input id="output" placeholder="Output" value="%s" hx-swap-oob="true" disabled>`,
+				"secret_"+html.EscapeString(b64Ciphertext),
+			)),
+		)
+	} else if action == "decrypt" {
+		nonceSplit := strings.Split(input, ".")
+		if len(nonceSplit) != 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		ciphertext, err := base64.StdEncoding.DecodeString(
+			strings.TrimPrefix(nonceSplit[0], "secret_"),
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		nonce, err := base64.StdEncoding.DecodeString(nonceSplit[1])
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		w.Write(
+			[]byte(fmt.Sprintf(
+				`<input id="output" placeholder="Output" value="%s" hx-swap-oob="true" disabled>`,
+				html.EscapeString(string(plaintext)),
+			)),
+		)
 	}
 }
 
