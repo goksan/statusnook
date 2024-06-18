@@ -133,3 +133,11 @@ mail-groups:
 In addition to adding the rename section, update all references to `engineers` with `engineering-team` and apply this configuration to execute the rename.
 
 After completing the rename, remove the `rename` section or at least the outdated part from your configuration, and reapply the configuration to ensure that future changes are applied successfully.
+
+## Secrets
+Secrets can be encrypted and decrypted via the settings page.
+
+<img src="https://github.com/goksan/statusnook/assets/17437810/78753b51-534a-4116-b5a7-6ba4dd05c7f7" width="800">
+<br><br>
+When Statusnook is applying a configuration it attempts to decrypt and replace any value prefixed with `secret_`.
+
