@@ -62,7 +62,7 @@ import (
 
 var BUILD = "dev"
 var CA = certmagic.LetsEncryptStagingCA
-var VERSION = "v0.2.0"
+var VERSION = "v0.3.0"
 
 //go:embed schema.sql
 var sqlSchema string
