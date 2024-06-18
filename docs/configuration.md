@@ -59,7 +59,7 @@ notification-channels:
   slack-internal-alerts:
     name: "Slack #internal-alerts"
     type: slack
-    webhook-url: https://hooks.slack.com/services/...
+    webhook-url: secret_4//EgNno+/nZwEiO44TQ4k/9FNLbh2zNJc8hJqWIwTIc0Q==.eoLscWK0jMFRkgWa
 monitors:
   get:
     name: Example
