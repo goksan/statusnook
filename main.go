@@ -371,7 +371,7 @@ func copyNonSlugToSlugTable(tx *sql.Tx, src string, dst string) error {
 		return nil
 	}
 
-	cte, err := generateSlugBackfillCte(tx, src)
+	cteQuery, params, err := generateSlugBackfillCte(tx, src)
 	if err != nil {
 		return fmt.Errorf("copyNonSlugToSlugTable.generateSlugBackfillCte: %w", err)
 	}
@@ -388,14 +388,14 @@ func copyNonSlugToSlugTable(tx *sql.Tx, src string, dst string) error {
 		from
 			%s;
 	`,
-		cte,
+		cteQuery,
 		dst,
 		strings.Join(dstCols, ", "),
 		strings.Join(srcColsPlusSlug, ", "),
 		src,
 	)
 
-	_, err = tx.Exec(query)
+	_, err = tx.Exec(query, params...)
 	if err != nil {
 		return fmt.Errorf("copyNonSlugToSlugTable.Exec: %w", err)
 	}
@@ -403,14 +403,14 @@ func copyNonSlugToSlugTable(tx *sql.Tx, src string, dst string) error {
 	return nil
 }
 
-func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, error) {
+func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, []any, error) {
 	pattern := regexp.MustCompile(`[^\p{L}\d]+`)
 
 	query := "select id, name from " + tableName + " order by id asc"
 
 	rows, err := tx.Query(query)
 	if err != nil {
-		return "", fmt.Errorf("generateSlugBackfillCte.Query: %w", err)
+		return "", []any{}, fmt.Errorf("generateSlugBackfillCte.Query: %w", err)
 	}
 	defer rows.Close()
 
@@ -424,7 +424,7 @@ func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, error) {
 
 		err := rows.Scan(&id, &name)
 		if err != nil {
-			return "", fmt.Errorf("generateSlugBackfillCte.Scan: %w", err)
+			return "", []any{}, fmt.Errorf("generateSlugBackfillCte.Scan: %w", err)
 		}
 
 		idToName[id] = name
@@ -432,7 +432,7 @@ func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, error) {
 	}
 
 	if len(idToName) == 0 {
-		return "", nil
+		return "", []any{}, nil
 	}
 
 	slices.Sort(sortedIds)
@@ -459,16 +459,19 @@ func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, error) {
 	}
 
 	if len(slugToId) == 0 {
-		return "", nil
+		return "", []any{}, nil
 	}
 
 	updateQuery := `
 		with t(slug, id) as(values
 	`
 
+	params := []any{}
+
 	i := 0
 	for slug, id := range slugToId {
-		updateQuery += fmt.Sprintf("('%s', %d)", slug, id)
+		updateQuery += "(?, ?)"
+		params = append(params, slug, id)
 		if i < len(slugToId)-1 {
 			updateQuery += ","
 		}
@@ -477,7 +480,7 @@ func generateSlugBackfillCte(tx *sql.Tx, tableName string) (string, error) {
 
 	updateQuery += ")"
 
-	return updateQuery, nil
+	return updateQuery, params, nil
 }
 
 var tmpls = map[string]*template.Template{}
