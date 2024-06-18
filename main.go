@@ -16985,7 +16985,7 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 				
 				<form hx-post hx-swap="none" autocomplete="off">
 					<label>
-						Configuration file
+						Text-based config				
 						<span class="subtext">
 							Enable to configure monitors, services, and notifications via YAML rather than web UI forms
 						</span>
