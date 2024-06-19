@@ -19,7 +19,7 @@ useradd statusnook --system -m
 cd /home/statusnook
 
 
-case $(uname -p) in
+case $(uname -m) in
     x86_64)
         goarch="amd64"
         ;;
