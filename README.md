@@ -62,6 +62,10 @@ docker compose up
 ### One-click cloud templates
 <a href="https://marketplace.digitalocean.com/apps/statusnook"><img width="200px" src="https://www.deploytodo.com/do-btn-blue-ghost.svg" alt="Deploy to DO" width="150px"></a>
 
+[![Deploy to Vultr](https://get.statusnook.com/images%2Fdeploy-vultr.svg)](https://www.vultr.com/marketplace/apps/statusnook)
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/VkhOWC?referralCode=rj6bHN)
+
 [![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/STATOK)
 
 
