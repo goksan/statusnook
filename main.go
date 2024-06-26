@@ -827,6 +827,7 @@ var cancelAppCtx context.CancelFunc
 var rwDB *sql.DB
 var metaSetup string
 var metaName string
+var metaShowAdminLink bool
 var metaDomain string
 var metaUnconfirmedDomain string
 var metaUnconfirmedDomainProblem string
@@ -845,6 +846,7 @@ type pageCtx struct {
 	HXRequest                bool
 	HXBoosted                bool
 	AdminArea                bool
+	ShowAdminLink            bool
 	Nav                      string
 	UnconfirmedDomainProblem string
 	UnconfirmedDomain        string
@@ -879,6 +881,7 @@ func getPageCtx(r *http.Request) pageCtx {
 		HXRequest:                r.Header.Get("HX-Request") == "true",
 		HXBoosted:                r.Header.Get("HX-Boosted") == "true",
 		AdminArea:                adminArea,
+		ShowAdminLink:            metaShowAdminLink,
 		Nav:                      adminURLPrefix,
 		UnconfirmedDomainProblem: metaUnconfirmedDomainProblem,
 		UnconfirmedDomain:        metaUnconfirmedDomain,
@@ -3553,6 +3556,18 @@ func main() {
 	}
 	metaName = name
 
+	showAdminLink, err := getMetaValue(tx, "showAdminLink")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Fatalf("main.getMetaValueShowAdminLink: %s", err)
+		return
+	}
+
+	metaShowAdminLink, err = strconv.ParseBool(showAdminLink)
+	if err != nil {
+		log.Fatalf("main.ParseBoolShowAdminLink: %s", err)
+		return
+	}
+
 	domain, err := getMetaValue(tx, "domain")
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		log.Fatalf("main.getMetaValueDomain: %s", err)
@@ -5603,10 +5618,9 @@ func index(w http.ResponseWriter, r *http.Request) {
 				
 				
 				<a class="index-link" href="/history" hx-boost="true">View full history</a>
-				{{if not .Ctx.Auth.ID}}
-					<a class="index-link index-link--secondary" href="/login" hx-boost="true">Manage this page</a>
+				{{if and .Ctx.ShowAdminLink (not .Ctx.Auth.ID)}}
+						<a class="index-link index-link--secondary" href="/login" hx-boost="true">Manage this page</a>
 				{{end}}
-
 				<dialog class="email-updates-modal">
 					<div>
 						<span>Get email updates</span>
@@ -15409,6 +15423,23 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	showAdminLinkStr, err := getMetaValue(tx, "showAdminLink")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("getSettings.getMetaValueShowAdminLink: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	showAdminLinkEnabled := false
+	if showAdminLinkStr != "" {
+		showAdminLinkEnabled, err = strconv.ParseBool(showAdminLinkStr)
+		if err != nil {
+			log.Printf("getSettings.ParseBoolShowAdminLink: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
 	configFileEnabledStr, err := getMetaValue(tx, "configFileEnabled")
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		log.Printf("getSettings.getMetaValueConfigFileEnabled: %s", err)
@@ -15644,12 +15675,33 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 							<button
 								type="button"
 								class="cancel-button"
-								onclick="document.querySelector('#domain').disabled = true;"
-							>
+								onclick="document.querySelector('#domain').disabled = true;">
 								Cancel
 							</button>
 						</div>
 					{{end}}
+				</form>
+
+				
+				<form id="showAdminLinkSetting" hx-post="" autocomplete="off" hx-swap="none">
+					<label for="general">
+						General
+					</label>
+					<div class="checkbox-group">
+								<label>
+									<input
+										name="showAdminLink"
+										type="checkbox"
+										{{if .ShowAdminLink}}
+											checked
+										{{end}}
+										hx-trigger="change from:body"
+                						hx-post="/admin/settings"
+										/>
+									Show 'Manage this page'-link on Status Page
+								</label>
+						
+						</div>
 				</form>
 
 				<div class="settings-users-header">
@@ -16029,6 +16081,7 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 			GitHubConfigSHA     string
 			GitHubCommitLink    string
 			GitHubConfigErrors  []string
+			ShowAdminLink       bool
 			Ctx                 pageCtx
 		}{
 			CurrentVersion:      VERSION,
@@ -16043,6 +16096,7 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 			GitHubCommitLink: githubRepoURL + "/blob/" + githubConfigBranch + "/" +
 				githubConfigPath,
 			GitHubConfigErrors: githubConfigErrors,
+			ShowAdminLink:      showAdminLinkEnabled,
 			Ctx:                getPageCtx(r),
 		},
 	)
@@ -16056,6 +16110,32 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 func postSettings(w http.ResponseWriter, r *http.Request) {
 	name := r.PostFormValue("name")
 	domain := strings.ToLower(r.PostFormValue("domain"))
+	showAdminLink := r.PostFormValue("showAdminLink")
+
+	isShowAdminLinkEnabled := strings.ToLower(strings.TrimSpace(showAdminLink)) == "on"
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("postSettings.BeginShowAdminLink: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	err = updateMetaValue(tx, "showAdminLink", strconv.FormatBool(isShowAdminLinkEnabled))
+	if err != nil {
+		log.Printf("postSettings.updateMetaValueShowAdminLink: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("postSettings.CommitShowAdminLink: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	metaShowAdminLink = isShowAdminLinkEnabled
 
 	if name != "" {
 		if metaConfigFileEnabled {
@@ -17315,6 +17395,7 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 		GitHubToken         string
 		GitHubWebhookSecret string
 		Domain              string
+		ShowAdminLink       bool
 		Ctx                 pageCtx
 	}{
 		ConfigFile:          configFile,
@@ -17325,6 +17406,7 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 		GitHubToken:         githubToken,
 		GitHubWebhookSecret: githubWebhookSecret,
 		Domain:              metaDomain,
+		ShowAdminLink:       metaShowAdminLink,
 		Ctx:                 getPageCtx(r),
 	})
 	if err != nil {
