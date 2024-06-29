@@ -134,7 +134,7 @@ create table notification_channel(
     id integer primary key,
     slug text not null unique,
     name text not null,
-    type text not null check(type in ('smtp', 'slack')),
+    type text not null,
     details text not null
 );
 

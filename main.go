@@ -578,7 +578,7 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 								{{if .Ctx.Index}}
 									<div>
 										<div class="get-updates-container">
-											{{if or .HasEmailAlertChannel .HasSlackSetup}}
+											{{if or .HasEmailAlertChannel .HasSlackSetup .HasDiscordSetup}}
 												<button class="get-updates">
 													<span>
 														<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
@@ -616,6 +616,15 @@ func parseTmpl(name string, markup string) (*template.Template, error) {
 															<path d="M78.1988 91.1003C71.0988 91.1003 65.2988 85.3003 65.2988 78.2003C65.2988 71.1003 71.0988 65.3003 78.1988 65.3003H110.499C117.599 65.3003 123.399 71.1003 123.399 78.2003C123.399 85.3003 117.599 91.1003 110.499 91.1003H78.1988Z" fill="#ECB22E"/>
 														</svg>
 														Slack
+													</a>
+												{{end}}
+												{{if and (or .HasEmailAlertChannel .HasSlackSetup) .HasDiscordSetup}}
+													<hr>
+												{{end}}
+												{{if .HasDiscordSetup}}
+													<a href="/subscribe/discord" target="_blank">
+														<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
+														Discord
 													</a>
 												{{end}}
 											</dialog>
@@ -1348,6 +1357,111 @@ func sendMonitorAlertSlack(
 	return nil
 }
 
+func sendMonitorAlertDiscord(
+	monitor Monitor,
+	channel NotificationChannel,
+	statusCode sql.NullInt64,
+	startedAt time.Time,
+	result string,
+	httpClient http.Client,
+	status string,
+) error {
+	discordDetail, ok := channel.Details.(DiscordNotificationDetails)
+	if !ok {
+		return fmt.Errorf(
+			"sendMonitorAlertDiscord.Assert: failed to assert channel %d",
+			channel.ID,
+		)
+	}
+
+	const downMarkup = `
+		{{- ":rotating_light:"}} {{.MonitorName}} started failing{{"\n\n"}}
+
+		{{- if .StatusCode}}
+			{{- "Status code"}}: {{.StatusCode}}{{"\n"}}
+		{{else}}
+			{{- "Failure reason"}}: {{.Result}}{{"\n"}}
+		{{- end}}
+		{{- "Checked at"}}: {{.CheckedAt}}{{"\n\n"}}
+		{{- "https://"}}{{.Domain}}/admin/monitors/{{.MonitorID}}
+	`
+
+	const upMarkup = `
+		{{- ":white_check_mark:"}} {{.MonitorName}} started succeeding{{"\n\n"}}
+
+		{{- "Checked at"}}: {{.CheckedAt}}{{"\n\n"}}
+		{{- "https://"}}{{.Domain}}/admin/monitors/{{.MonitorID}}
+	`
+
+	markup := downMarkup
+	if status == "up" {
+		markup = upMarkup
+	}
+
+	tmpl, err := parseTextTmpl(status+"MonitorDiscord", markup)
+	if err != nil {
+		return fmt.Errorf("sendMonitorAlertDiscord.parseEmailTmpls: %w", err)
+	}
+
+	emailStr := bytes.Buffer{}
+
+	err = tmpl.Execute(
+		&emailStr,
+		struct {
+			MonitorID   int
+			MonitorName string
+			StatusCode  int
+			CheckedAt   string
+			Result      string
+			Domain      string
+		}{
+			MonitorID:   monitor.ID,
+			MonitorName: monitor.Name,
+			StatusCode:  int(statusCode.Int64),
+			CheckedAt:   startedAt.Format("2006/01/02 15:04:05 MST"),
+			Result:      result,
+			Domain:      metaDomain,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("sendMonitorAlertDiscord.Execute: %w", err)
+	}
+
+	type DiscordWebhookRequestBody struct {
+		Content string `json:"content"`
+	}
+
+	body := DiscordWebhookRequestBody{
+		Content: emailStr.String(),
+	}
+
+	serializedBody, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("sendMonitorAlertDiscord.Marshal: %w", err)
+	}
+
+	resp, err := httpClient.Post(
+		discordDetail.WebhookURL,
+		"application/json",
+		bytes.NewBuffer(serializedBody),
+	)
+	if err != nil {
+		return fmt.Errorf("sendMonitorAlertDiscord.Post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("sendMonitorAlertDiscord.ReadAll: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("sendMonitorAlertDiscord.StatusCode: %s", string(data))
+	}
+
+	return nil
+}
+
 func monitorLoop(ctx context.Context, wg *sync.WaitGroup) {
 	checkoutMu := sync.RWMutex{}
 	lastCheckedMu := sync.RWMutex{}
@@ -1621,6 +1735,20 @@ func monitorLoop(ctx context.Context, wg *sync.WaitGroup) {
 											log.Printf("monitorLoop.sendMonitorAlertSlack: %s", err)
 											continue
 										}
+									} else if channel.Type == "discord" {
+										err = sendMonitorAlertDiscord(
+											monitor,
+											channel,
+											statusCode,
+											startedAt,
+											result,
+											httpClient,
+											status,
+										)
+										if err != nil {
+											log.Printf("monitorLoop.sendMonitorAlertDiscord: %s", err)
+											continue
+										}
 									}
 								}
 							}
@@ -1729,16 +1857,19 @@ func notificationLoop(ctx context.Context, wg *sync.WaitGroup) {
 						}
 						defer tx.Rollback()
 
-						notificationChannelID, err := getAlertSMTPNotificationSetting(tx)
-						if err != nil {
+						smtpNotificationChannelID, err := getAlertSMTPNotificationSetting(tx)
+						if err != nil && !errors.Is(err, sql.ErrNoRows) {
 							log.Printf("notificationLoop.getAlertSMTPNotificationSetting: %s", err)
 							return
 						}
 
-						notificationChannel, err := getNotificationChannelByID(tx, notificationChannelID)
-						if err != nil {
-							log.Printf("notificationLoop.getNotificationChannelByID: %s", err)
-							return
+						var smtpNotificationChannel NotificationChannel
+						if smtpNotificationChannelID != 0 {
+							smtpNotificationChannel, err = getNotificationChannelByID(tx, smtpNotificationChannelID)
+							if err != nil {
+								log.Printf("notificationLoop.getNotificationChannelByID: %s", err)
+								return
+							}
 						}
 
 						alertSettings, err := getAlertSettings(tx)
@@ -1857,7 +1988,7 @@ func notificationLoop(ctx context.Context, wg *sync.WaitGroup) {
 								&notificationStr,
 							)
 							if err != nil {
-								log.Printf("notificationLoop.Post: %s", err)
+								log.Printf("notificationLoop.PostSlack: %s", err)
 								return
 							}
 							defer resp.Body.Close()
@@ -1884,8 +2015,122 @@ func notificationLoop(ctx context.Context, wg *sync.WaitGroup) {
 								log.Printf("notificationLoop.SlackCommit: %s", err)
 								return
 							}
+						} else if notification.Type == "discord" {
+							httpClient := http.Client{
+								Timeout: time.Second * 10,
+							}
+
+							const text = `
+								**{{.Title}}**
+
+								{{.Content}}
+
+								{{"Affected services"}}: {{.Services}}
+								{{- if eq .AlertType "incident"}}
+									{{"Severity"}}: {{.Severity}}
+								{{end}}
+							`
+
+							tmpl, err := parseTextTmpl(
+								"alertDiscord",
+								strings.ReplaceAll(text, "\t", ""),
+							)
+							if err != nil {
+								log.Printf("notificationLoop.parseTextTemplDiscord: %s", err)
+								return
+							}
+
+							notificationStr := bytes.Buffer{}
+
+							err = tmpl.Execute(
+								&notificationStr,
+								struct {
+									Title     string
+									Content   string
+									Services  string
+									AlertType string
+									Severity  string
+									Domain    string
+								}{
+									Title: strings.ToUpper(notification.AlertType[:1]) +
+										notification.AlertType[1:] + " - " + notification.AlertTitle,
+									Content:   notification.Content,
+									Services:  notification.AlertServices,
+									AlertType: notification.AlertType,
+									Severity:  severityEmoji,
+									Domain:    metaDomain,
+								},
+							)
+							if err != nil {
+								log.Printf("notificationLoop.ExecuteDiscord: %s", err)
+								return
+							}
+
+							body := struct {
+								Content    string `json:"content"`
+								Components []any  `json:"components"`
+							}{
+								Content: notificationStr.String(),
+								Components: []any{
+									map[string]any{
+										"type": 1,
+										"components": []any{
+											map[string]any{
+												"type":  2,
+												"label": "Visit status page",
+												"style": 5,
+												"url":   "https://" + metaDomain,
+											},
+										},
+									},
+								},
+							}
+
+							serializedBody, err := json.Marshal(body)
+							if err != nil {
+								log.Printf("notificationLoop.Marshal: %s", err)
+								return
+							}
+
+							resp, err := httpClient.Post(
+								notification.Destination,
+								"application/json",
+								bytes.NewBufferString(string(serializedBody)),
+							)
+							if err != nil {
+								log.Printf("notificationLoop.PostDiscord: %s", err)
+								return
+							}
+							defer resp.Body.Close()
+
+							tx, err := rwDB.Begin()
+							if err != nil {
+								log.Printf("notificationLoop.BeginDiscord: %s", err)
+								return
+							}
+							defer tx.Rollback()
+
+							err = updateAlertSentAtByID(
+								tx,
+								time.Now().UTC(),
+								[]int{notification.AlertNotificationID},
+							)
+							if err != nil {
+								log.Printf("notificationLoop.updateAlertSentAtByID: %s", err)
+								return
+							}
+
+							err = tx.Commit()
+							if err != nil {
+								log.Printf("notificationLoop.CommitDiscord: %s", err)
+								return
+							}
 						} else if notification.Type == "email" {
-							smtpDetail, ok := notificationChannel.Details.(SMTPNotificationDetails)
+							if smtpNotificationChannel.ID == 0 {
+								return
+							}
+
+							smtpDetail, ok := smtpNotificationChannel.Details.(SMTPNotificationDetails)
 							if !ok {
 								log.Printf("notificationLoop.NotificationDetailsAssert: %s", err)
 								return
@@ -2310,6 +2555,10 @@ type StatusnookConfigSlackNotificationChannel struct {
 	WebhookURL string `json:"webhookURL" yaml:"webhook-url"`
 }
 
+type StatusnookConfigDiscordNotificationChannel struct {
+	WebhookURL string `json:"webhookURL" yaml:"webhook-url"`
+}
+
 type StatusnookConfigSMTPNotificationChannel struct {
 	Host     string            `json:"host" yaml:"host"`
 	Port     int               `json:"port" yaml:"port"`
@@ -2347,6 +2596,8 @@ type StatusnookConfigAlertNotificationSettings struct {
 	ManagedSubscriptions     bool   `json:"managed-subscriptions,omitempty" yaml:"managed-subscriptions,omitempty"`
 	SlackClientSecret        string `json:"slack-client-secret,omitempty" yaml:"slack-client-secret,omitempty"`
 	SlackInstallURL          string `json:"slack-install-url,omitempty" yaml:"slack-install-url,omitempty"`
+	DiscordClientSecret      string `json:"discord-client-secret,omitempty" yaml:"discord-client-secret,omitempty"`
+	DiscordClientID          string `json:"discord-client-id,omitempty" yaml:"discord-client-id,omitempty"`
 }
 
 type StatusnookConfigMailGroup struct {
@@ -2807,8 +3058,8 @@ func applyConfig(tx *sql.Tx, cfgBytes []byte) ([]string, error) {
 			msgs = append(msgs, "notification-channels."+slug+": type is required")
 		}
 
-		if cType != "smtp" && cType != "slack" {
-			msgs = append(msgs, "notification-channels."+slug+": type must be one of smtp, slack")
+		if cType != "smtp" && cType != "slack" && cType != "discord" {
+			msgs = append(msgs, "notification-channels."+slug+": type must be one of smtp, slack, discord")
 		}
 
 		nameAny, ok := v["name"]
@@ -3043,6 +3294,62 @@ func applyConfig(tx *sql.Tx, cfgBytes []byte) ([]string, error) {
 			}
 
 			details = string(detailBytes)
+		} else if channel.Type == "discord" {
+			unknownProps := []string{}
+
+			requiredProps := map[string]bool{
+				"type":        true,
+				"name":        true,
+				"webhook-url": true,
+			}
+
+			for k := range v {
+				if _, ok := requiredProps[k]; !ok {
+					unknownProps = append(unknownProps, k)
+				}
+			}
+
+			for _, prop := range unknownProps {
+				msgs = append(
+					msgs,
+					"notification-channels."+slug+": "+prop+
+						" is an invalid property for a discord notification channel",
+				)
+			}
+
+			webhookURLAny, ok := v["webhook-url"]
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is required")
+			}
+
+			webhookURL, ok := webhookURLAny.(string)
+			if !ok {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is invalid")
+			} else if webhookURL == "" {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is required")
+			}
+
+			validURL := true
+			parsedReqURL, err := url.Parse(webhookURL)
+			if err != nil {
+				validURL = false
+			} else if parsedReqURL.Scheme == "" || parsedReqURL.Host == "" {
+				validURL = false
+			} else if parsedReqURL.Scheme != "http" && parsedReqURL.Scheme != "https" {
+				validURL = false
+			}
+
+			if !validURL {
+				msgs = append(msgs, "notification-channels."+slug+": webhook-url is invalid")
+			}
+
+			d := StatusnookConfigDiscordNotificationChannel{WebhookURL: webhookURL}
+			detailBytes, err := json.Marshal(d)
+			if err != nil {
+				return msgs, fmt.Errorf("applyConfig.MarshalDiscordNotificationDetails: %w", err)
+			}
+
+			details = string(detailBytes)
 		}
 
 		if _, ok := existingNotificationChannelSlugs[slug]; ok {
@@ -3260,6 +3567,8 @@ func applyConfig(tx *sql.Tx, cfgBytes []byte) ([]string, error) {
 		tx,
 		cfg.AlertNotificationSettings.SlackInstallURL,
 		cfg.AlertNotificationSettings.SlackClientSecret,
+		cfg.AlertNotificationSettings.DiscordClientID,
+		cfg.AlertNotificationSettings.DiscordClientSecret,
 		managedSubscriptions,
 	)
 	if err != nil {
@@ -3401,6 +3710,17 @@ func generateConfig(tx *sql.Tx) (string, error) {
 				"name":        v.Name,
 				"webhook-url": details.WebhookURL,
 			}
+		} else if v.Type == "discord" {
+			details, ok := v.Details.(DiscordNotificationDetails)
+			if !ok {
+				return cfgStr, fmt.Errorf("generateConfig.AssertDiscordNotificationDetails")
+			}
+
+			cfgNotificationChannels[v.Slug] = map[string]any{
+				"type":        v.Type,
+				"name":        v.Name,
+				"webhook-url": details.WebhookURL,
+			}
 		}
 	}
 
@@ -3502,6 +3822,8 @@ func generateConfig(tx *sql.Tx) (string, error) {
 			ManagedSubscriptions:     alertSettings.ManagedSubscriptions,
 			SlackClientSecret:        alertSettings.SlackClientSecret,
 			SlackInstallURL:          alertSettings.SlackInstallURL,
+			DiscordClientID:          alertSettings.DiscordClientID,
+			DiscordClientSecret:      alertSettings.DiscordClientSecret,
 		},
 		GeneralSettings: StatusnookConfigGeneralSettings{Name: metaName},
 	}
@@ -3797,7 +4119,7 @@ func main() {
 		r.Route("/notifications", func(r chi.Router) {
 			r.Get("/", notifications)
 			r.Get("/create", getCreateNotification)
-			r.Post("/create", postCreateNotification)
+			r.Post("/create", postCreateNotificationChannel)
 			r.Delete("/{id}", deleteNotificationChannel)
 			r.Get("/{id}/edit", getEditNotification)
 			r.Post("/{id}/edit", postEditNotification)
@@ -3916,6 +4238,8 @@ func main() {
 		r.Post("/name", postSetupName)
 	})
 	r.Get("/callback/slack", slackOAuth2Callback)
+	r.Get("/callback/discord", discordOAuth2Callback)
+	r.Get("/subscribe/discord", getSubscribeDiscord)
 	r.Post("/subscribe/email", postSubscribeEmail)
 	r.Get("/subscribe/email/confirm", getSubscribeEmailConfirm)
 	r.Post("/subscribe/email/confirm", postSubscribeEmailConfirm)
@@ -4137,9 +4461,15 @@ func updateEmailAlertSubscriptionActiveByEmail(tx *sql.Tx, email string, active 
 	return nil
 }
 
-func createAlertSubscription(tx *sql.Tx, subscriptionType string, destination string, meta string) error {
+func createAlertSubscription(
+	tx *sql.Tx,
+	subscriptionType string,
+	destination string,
+	meta string,
+) error {
 	const query = `
-		insert into alert_subscription(type, destination, meta) values(?, ?, nullif(?, ''))
+		insert into alert_subscription(type, destination, meta) 
+			values(?, ?, nullif(?, ''))
 		on conflict(type, destination) do update set active = true
 	`
 
@@ -4259,6 +4589,99 @@ func slackOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/?slack_app_installed=1", http.StatusFound)
+}
+
+type DiscordOAuthAccessResponse struct {
+	Webhook struct {
+		ChannelID string `json:"channel_id"`
+		URL       string `json:"url"`
+	} `json:"webhook"`
+}
+
+func discordOAuth2Callback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tx, err := rwDB.Begin()
+	if err != nil {
+		log.Printf("discordOAuth2Callback.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	settings, err := getAlertSettings(tx)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.getAlertSettings: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	form := url.Values{}
+	form.Add("redirect_uri", "https://"+metaDomain+"/callback/discord")
+	form.Add("grant_type", "authorization_code")
+	form.Add("code", code)
+	form.Add("client_id", settings.DiscordClientID)
+	form.Add("client_secret", settings.DiscordClientSecret)
+
+	resp, err := http.PostForm("https://discord.com/api/oauth2/token", form)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.PostForm: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.ReadAll: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	accessResponse := DiscordOAuthAccessResponse{}
+	err = json.Unmarshal(respBody, &accessResponse)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.Unmarshal: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = deleteAlertSubscriptionByMeta(tx, accessResponse.Webhook.ChannelID)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.deleteAlertSubscriptionByMeta: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = createAlertSubscription(
+		tx,
+		"discord",
+		accessResponse.Webhook.URL,
+		accessResponse.Webhook.ChannelID,
+	)
+	if err != nil {
+		log.Printf("discordOAuth2Callback.createAlertSubscription: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Printf("discordOAuth2Callback.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/?discord_app_installed=1", http.StatusFound)
 }
 
 func postmarkDeleteSuppression(email string, token string, stream string) error {
@@ -4772,7 +5195,9 @@ func getSubscribeEmailConfirm(w http.ResponseWriter, r *http.Request) {
 						{method: "POST"}
 					);
 
-					window.location.href = response.url;
+					if (response.redirected) {
+						window.location.href = response.url;
+					}
 				})();
 			</script>		
 		{{end}}
@@ -5098,6 +5523,41 @@ func postResubscribe(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+}
+
+func getSubscribeDiscord(w http.ResponseWriter, r *http.Request) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("getSubscribeDiscord.Begin: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	alertSettings, err := getAlertSettings(tx)
+	if err != nil {
+		log.Printf("getSubscribeDiscord.getAlertSettings: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if alertSettings.DiscordClientID == "" || alertSettings.DiscordClientSecret == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	url := "https://discord.com/oauth2/authorize?scope=webhook.incoming" +
+		"&client_id=" + alertSettings.DiscordClientID +
+		"&integration_type=0&response_type=code" +
+		"&redirect_uri=" + "https://" + metaDomain + "/callback/discord"
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("getSubscribeDiscord.Commit: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 func getInvitation(w http.ResponseWriter, r *http.Request) {
@@ -5513,6 +5973,9 @@ func index(w http.ResponseWriter, r *http.Request) {
 		hasSlackSetup = alertSettings.SlackInstallURL
 	}
 
+	hasDiscordSetup := alertSettings.DiscordClientSecret != "" &&
+		alertSettings.DiscordClientID != ""
+
 	emailAlertChannelID, err := getAlertSMTPNotificationSetting(tx)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		log.Printf("index.getAlertSMTPNotificationSetting: %s", err)
@@ -5641,6 +6104,18 @@ func index(w http.ResponseWriter, r *http.Request) {
 						<button onclick="document.querySelector('.slack-success-modal').close();">Dismiss</button>
 					</div>
 				</dialog>
+				<dialog class="discord-success-modal success-modal">
+					<div>
+						<div>
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+								<path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z" clip-rule="evenodd" />
+							</svg>
+						</div>
+						<span>Updates will appear in Discord</span>
+
+						<button onclick="document.querySelector('.discord-success-modal').close();">Dismiss</button>
+					</div>
+				</dialog>
 				<dialog class="email-confirmation-success-modal success-modal">
 					<div>
 						<div>
@@ -5659,6 +6134,11 @@ func index(w http.ResponseWriter, r *http.Request) {
 						const query = new URLSearchParams(window.location.search);
 						if (query.get("slack_app_installed")) {
 							document.querySelector(".slack-success-modal").showModal();
+							history.replaceState(null, "", "/");
+						}
+
+						if (query.get("discord_app_installed")) {
+							document.querySelector(".discord-success-modal").showModal();
 							history.replaceState(null, "", "/");
 						}
 	
@@ -5768,6 +6248,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 			ServiceStatuses      map[int]string
 			HasEmailAlertChannel bool
 			HasSlackSetup        string
+			HasDiscordSetup      bool
 			Ctx                  pageCtx
 		}{
 			Services:             services,
@@ -5775,6 +6256,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 			ServiceStatuses:      serviceStatuses,
 			HasEmailAlertChannel: hasEmailAlertChannel,
 			HasSlackSetup:        hasSlackSetup,
+			HasDiscordSetup:      hasDiscordSetup,
 			Ctx:                  getPageCtx(r),
 		},
 	)
@@ -8188,6 +8670,8 @@ func getEditMonitor(w http.ResponseWriter, r *http.Request) {
 												<path d="M78.1988 97.6001C85.2988 97.6001 91.0988 103.4 91.0988 110.5C91.0988 117.6 85.2988 123.4 78.1988 123.4C71.0988 123.4 65.2988 117.6 65.2988 110.5V97.6001H78.1988Z" fill="#ECB22E"/>
 												<path d="M78.1988 91.1003C71.0988 91.1003 65.2988 85.3003 65.2988 78.2003C65.2988 71.1003 71.0988 65.3003 78.1988 65.3003H110.499C117.599 65.3003 123.399 71.1003 123.399 78.2003C123.399 85.3003 117.599 91.1003 110.499 91.1003H78.1988Z" fill="#ECB22E"/>
 											</svg>
+										{{else if eq $notification.Type "discord"}}
+											<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
 										{{end}}
 										{{$notification.Name}}
 									</span>
@@ -9191,6 +9675,8 @@ func getCreateMonitor(w http.ResponseWriter, r *http.Request) {
 													<path d="M78.1988 97.6001C85.2988 97.6001 91.0988 103.4 91.0988 110.5C91.0988 117.6 85.2988 123.4 78.1988 123.4C71.0988 123.4 65.2988 117.6 65.2988 110.5V97.6001H78.1988Z" fill="#ECB22E"/>
 													<path d="M78.1988 91.1003C71.0988 91.1003 65.2988 85.3003 65.2988 78.2003C65.2988 71.1003 71.0988 65.3003 78.1988 65.3003H110.499C117.599 65.3003 123.399 71.1003 123.399 78.2003C123.399 85.3003 117.599 91.1003 110.499 91.1003H78.1988Z" fill="#ECB22E"/>
 												</svg>
+											{{else if eq $notification.Type "discord"}}
+												<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
 											{{end}}
 											{{$notification.Name}}
 										</span>
@@ -9882,6 +10368,8 @@ func getAlertByID(tx *sql.Tx, id int) (AlertDetail, error) {
 type AlertSettings struct {
 	SlackInstallURL      string
 	SlackClientSecret    string
+	DiscordClientSecret  string
+	DiscordClientID      string
 	ManagedSubscriptions bool
 }
 
@@ -9910,6 +10398,10 @@ func getAlertSettings(tx *sql.Tx) (AlertSettings, error) {
 			settings.SlackInstallURL = v
 		} else if k == "slack-client-secret" {
 			settings.SlackClientSecret = v
+		} else if k == "discord-client-secret" {
+			settings.DiscordClientSecret = v
+		} else if k == "discord-client-id" {
+			settings.DiscordClientID = v
 		} else if k == "managed-subscriptions" {
 			parsedV, err := strconv.ParseBool(v)
 			if err != nil {
@@ -10110,7 +10602,6 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 					</label>
 
 					<div class="slack-container" style="display: block;">
-
 						<a 
 							class="help"
 							href="https://api.slack.com/apps"
@@ -10124,18 +10615,14 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 
 						</a>
 
-						<button 
-							type="button"
-							class="help"
-							onclick="document.querySelector('.slack-tutorial').classList.toggle('slack-tutorial--visible');"
-						>
-							How do I create a Slack app?
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-								<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-							</svg>
-						</button>
+						<details class="tutorial">
+							<summary class="help">
+								How do I create a Slack app?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</summary>
 
-						<div class="slack-tutorial">
 							<a href="https://api.slack.com/apps/new" target="_blank">
 								<svg viewBox="0 0 124 124" fill="none" xmlns="http://www.w3.org/2000/svg">
 									<path d="M26.3996 78.2003C26.3996 85.3003 20.5996 91.1003 13.4996 91.1003C6.39961 91.1003 0.599609 85.3003 0.599609 78.2003C0.599609 71.1003 6.39961 65.3003 13.4996 65.3003H26.3996V78.2003Z" fill="#E01E5A"/>
@@ -10165,20 +10652,15 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 								src="/static/images/slack-notification-tutorial/2.png"
 								style="width: 60%;"
 							/>
-						</div>
+						</details>
 
-						<button 
-							type="button"
-							class="help"
-							onclick="document.querySelector('.slack-tutorial-app').classList.toggle('slack-tutorial-app--visible');"
-						>
-							How do I configure my Slack app for status page alerts?
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-								<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-							</svg>
-						</button>
-
-						<div class="slack-tutorial-app">
+						<details class="tutorial">
+							<summary class="help">		
+								How do I configure my Slack app for status page alerts?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</summary>
 							<p>Turn incoming webhooks on - you don't need to add any webhooks</p>
 							<img
 								src="/static/images/slack-notification-tutorial/configure-1.png"
@@ -10205,7 +10687,103 @@ func getAlertNotifications(w http.ResponseWriter, r *http.Request) {
 								src="/static/images/slack-notification-tutorial/configure-4.png"
 								style="width: 100%;"
 							/>
-						</div>
+						</details>
+					</div>
+
+					<hr style="border: 1px solid #F6F6F6; margin-top: 3.6rem; margin-bottom: 3.6rem;">
+
+					<label>
+						Discord client secret
+						<span class="subtext">
+							Paste the client secret for your Discord app
+						</span>
+						<input name="discord-client-secret" type="password" value="{{$.Settings.DiscordClientSecret}}">
+					</label>
+
+					<label>
+						Discord client ID
+						<span class="subtext">
+							Paste the client ID for your Discord app
+						</span>
+						<input name="discord-client-id" value="{{$.Settings.DiscordClientID}}">
+					</label>
+
+					<div class="slack-container" style="display: block;">
+						<a 
+							class="help"
+							href="https://discord.com/developers/applications"
+							target="_blank"
+						>
+							Go to your Discord apps
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+								<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+								<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+							</svg>
+
+						</a>
+
+						<details class="tutorial">
+							<summary class="help">
+								How do I create a Discord app?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</summary>
+							<a href="https://discord.com/developers/applications" target="_blank">
+								<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
+								Create a new Discord app
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+									<path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
+									<path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+								</svg>
+							</a>
+
+							<p>Select the "New Application"</p>
+							<img 
+								src="/static/images/discord-webhook-tutorial/2.png"
+								style="width: 100%;"
+							/>
+
+							<p>Name your app, agree to the terms, and click "Create"</p>
+							<img 
+								src="/static/images/discord-webhook-tutorial/3.png"
+								style="width: 100%;"
+							/>
+						</details>
+
+						<details class="tutorial">
+							<summary class="help">
+								How do I configure my Discord app for status page alerts?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</summary>
+							<p>Select "OAuth2"</p>
+							<p>
+								Add the following redirect URL to your Discord app:
+								https://{{.Domain}}/callback/discord
+							</p>
+							<p>
+								Click "Save Changes"
+							</p>
+							<img
+								src="/static/images/discord-webhook-tutorial/4.png"
+								style="width: 100%;"
+							/>							
+
+							<p>Click "Reset Secret" under client secret, and confirm the action</p>
+							<img 
+								src="/static/images/discord-webhook-tutorial/5.png"
+								style="width: 100%;"
+							/>
+
+							<p>Copy and paste your client ID into Statusnook</p>
+							<p>Copy and paste your client secret into Statusnook</p>
+							<img 
+								src="/static/images/discord-webhook-tutorial/6.png"
+								style="width: 100%;"
+							/>
+						</details>
 					</div>
 					
 					<div>
@@ -10271,10 +10849,13 @@ func updateAlertSettings(
 	tx *sql.Tx,
 	slackInstallURL string,
 	slackClientSecret string,
+	discordClientID string,
+	discordClientSecret string,
 	managedSubscriptions bool,
 ) error {
 	const query = `
-		insert into alert_setting(name, value) values(?, ?), (?, ?), (?, ?)
+		insert into alert_setting(name, value) values(?, ?), (?, ?), (?, ?), (?, ?), 
+			(?, ?)
 		on conflict(name) do update set value = excluded.value
 	`
 
@@ -10284,6 +10865,10 @@ func updateAlertSettings(
 		slackInstallURL,
 		"slack-client-secret",
 		slackClientSecret,
+		"discord-client-id",
+		discordClientID,
+		"discord-client-secret",
+		discordClientSecret,
 		"managed-subscriptions",
 		managedSubscriptions,
 	)
@@ -10337,6 +10922,9 @@ func postAlertNotifications(w http.ResponseWriter, r *http.Request) {
 
 	slackClientSecretParam := r.FormValue("slack-client-secret")
 
+	discordClientSecret := r.FormValue("discord-client-secret")
+	discordClientID := r.FormValue("discord-client-id")
+
 	smtpNotificationChannelIDParam := r.FormValue("smtp-notification-channel")
 	smtpNotificationChannelID := 0
 	if smtpNotificationChannelIDParam != "" {
@@ -10381,7 +10969,14 @@ func postAlertNotifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = updateAlertSettings(tx, slackInstallURL, slackClientSecretParam, managedSubscriptions)
+	err = updateAlertSettings(
+		tx,
+		slackInstallURL,
+		slackClientSecretParam,
+		discordClientID,
+		discordClientSecret,
+		managedSubscriptions,
+	)
 	if err != nil {
 		log.Printf("postAlertNotifications.updateAlertSettings: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -12581,6 +13176,8 @@ func notifications(w http.ResponseWriter, r *http.Request) {
 												<path d="M78.1988 97.6001C85.2988 97.6001 91.0988 103.4 91.0988 110.5C91.0988 117.6 85.2988 123.4 78.1988 123.4C71.0988 123.4 65.2988 117.6 65.2988 110.5V97.6001H78.1988Z" fill="#ECB22E"/>
 												<path d="M78.1988 91.1003C71.0988 91.1003 65.2988 85.3003 65.2988 78.2003C65.2988 71.1003 71.0988 65.3003 78.1988 65.3003H110.499C117.599 65.3003 123.399 71.1003 123.399 78.2003C123.399 85.3003 117.599 91.1003 110.499 91.1003H78.1988Z" fill="#ECB22E"/>
 											</svg>
+										{{else if eq $notification.Type "discord"}}
+											<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
 										{{end}}
 										<div>
 											{{if eq $notification.Type "smtp"}}
@@ -12755,21 +13352,14 @@ func getCreateNotification(w http.ResponseWriter, r *http.Request) {
 				<form hx-post hx-swap="none" autocomplete="off">
 					<script>
 						function onNotificationTypeSelected(input) {
-							if (input.value === "smtp") {
-								document.querySelector(".smtp-container").classList.add("smtp-container--visible");
-								document.querySelector(".smtp-container").disabled = false;
+							[...input.form.querySelectorAll("fieldset")].forEach((el) => {								
+								el.classList.remove("visible");
+								el.disabled = true;
+							});
 
-								document.querySelector(".slack-container").classList.remove("slack-container--visible");
-								document.querySelector(".slack-container").disabled = true;
-							}
-
-							if (input.value === "slack") {
-								document.querySelector(".slack-container").classList.add("slack-container--visible");
-								document.querySelector(".slack-container").disabled = false;
-										
-								document.querySelector(".smtp-container").classList.remove("smtp-container--visible");
-								document.querySelector(".smtp-container").disabled = true;
-							}
+							const selected = input.form.querySelector("." + input.value + "-container");
+							selected.classList.add("visible");
+							selected.disabled = false;
 						}
 					</script>
 
@@ -12818,6 +13408,20 @@ func getCreateNotification(w http.ResponseWriter, r *http.Request) {
 								Slack
 							</span>
 						</label>
+						<label>
+							<input 
+								type="radio"
+								name="type"
+								value="discord"
+								onclick="onNotificationTypeSelected(this);" 
+								autocomplete="off" 
+								required
+							/>
+							<span>
+								<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"/></svg>
+								Discord
+							</span>
+						</label>
 					</div>
 
 					<label>
@@ -12825,7 +13429,7 @@ func getCreateNotification(w http.ResponseWriter, r *http.Request) {
 						<input name="display-name" required />
 					</label>
 					
-					<fieldset class="smtp-container smtp-container--visible">
+					<fieldset class="smtp-container visible">
 						<legend class="hide">SMTP details</legend>
 						<label>
 							Host
@@ -12915,20 +13519,15 @@ func getCreateNotification(w http.ResponseWriter, r *http.Request) {
 						<label>
 							Webhook URL
 							<input name="webhook-url" type="url" required />
+						</label>
 
-							<button 
-								type="button"
-								class="help"
-								onclick="document.querySelector('.slack-tutorial').classList.toggle('slack-tutorial--visible');"
-							>
+						<details class="tutorial">
+							<summary class="help">
 								How do I get a webhook URL?
 								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
 									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
 								</svg>
-							</button>
-						</label>
-
-						<div class="slack-tutorial">
+							</summary>
 							<p>You'll need to create a Slack app (if you haven't already) and then add a new webhook to your workspace.</p>
 
 							<a href="https://api.slack.com/apps/new" target="_blank">
@@ -12980,7 +13579,31 @@ func getCreateNotification(w http.ResponseWriter, r *http.Request) {
 								src="/static/images/slack-notification-tutorial/5.png"
 								style="width: 100%;"
 							/>
-						</div>
+						</details>
+					</fieldset>
+
+					<fieldset class="discord-container" disabled>
+						<legend class="hide">Discord info</legend>
+						<label>
+							Webhook URL
+							<input name="webhook-url" type="url" required />
+						</label>
+
+						<details class="tutorial">
+							<summary class="help">
+								How do I get a webhook URL?
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+								</svg>
+							</summary>
+							<p>Open your Server Settings and head into the Integrations tab</p>
+							<p>Click the "Create Webhook" button to create a new webhook!</p>
+						
+							<img 
+								src="/static/images/discord-webhook-tutorial/1.png"
+								style="width: 100%;"
+							/>
+						</details>
 					</fieldset>
 
 					<div>
@@ -13082,6 +13705,10 @@ type SlackNotificationDetails struct {
 	WebhookURL string `json:"webhookURL"`
 }
 
+type DiscordNotificationDetails struct {
+	WebhookURL string `json:"webhookURL"`
+}
+
 type NotificationChannel struct {
 	ID      int
 	Slug    string
@@ -13143,6 +13770,15 @@ func listNotificationChannels(tx *sql.Tx, options listNotificationsOptions) ([]N
 			}
 
 			channel.Details = details
+		} else if channel.Type == "discord" {
+			var details DiscordNotificationDetails
+
+			err := json.Unmarshal([]byte(detailsStr), &details)
+			if err != nil {
+				return channels, fmt.Errorf("listNotificationChannels.UnmarshalDiscord: %w", err)
+			}
+
+			channel.Details = details
 		}
 
 		channels = append(channels, channel)
@@ -13194,6 +13830,14 @@ func listNotificationChannelsByMonitorID(tx *sql.Tx, monitorID int) ([]Notificat
 			if err != nil {
 				return notifications, fmt.Errorf("listNotificationChannelsByMonitorID.UnmarshalSlack: %w", err)
 			}
+			channel.Details = details
+		} else if channel.Type == "discord" {
+			var details DiscordNotificationDetails
+
+			err := json.Unmarshal([]byte(detailsStr), &details)
+			if err != nil {
+				return notifications, fmt.Errorf("listNotificationChannelsByMonitorID.UnmarshalDiscord: %w", err)
+			}
 
 			channel.Details = details
 		}
@@ -13223,14 +13867,16 @@ func createNotification(
 	return nil
 }
 
-func postCreateNotification(w http.ResponseWriter, r *http.Request) {
+func postCreateNotificationChannel(w http.ResponseWriter, r *http.Request) {
 	if metaConfigFileEnabled {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	notificationType := r.PostFormValue("type")
-	if notificationType != "smtp" && notificationType != "slack" {
+	if notificationType != "smtp" &&
+		notificationType != "slack" &&
+		notificationType != "discord" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -13306,7 +13952,7 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 
 		tx, err := rwDB.Begin()
 		if err != nil {
-			log.Printf("postCreateNotification.BeginSMTP: %s", err)
+			log.Printf("postCreateNotificationChannel.BeginSMTP: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13330,7 +13976,7 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 
 		channels, err := listNotificationChannels(tx, listNotificationsOptions{})
 		if err != nil {
-			log.Printf("postCreateNotification.listNotificationChannelsSMTP: %s", err)
+			log.Printf("postCreateNotificationChannel.listNotificationChannelsSMTP: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13348,13 +13994,13 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 			string(serializedDetails),
 		)
 		if err != nil {
-			log.Printf("postCreateNotification.createNotificationSMTP: %s", err)
+			log.Printf("postCreateNotificationChannel.createNotificationSMTP: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		if err = tx.Commit(); err != nil {
-			log.Printf("postCreateNotification.CommitSMTP: %s", err)
+			log.Printf("postCreateNotificationChannel.CommitSMTP: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13362,11 +14008,12 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 		webhookURL, err := url.ParseRequestURI(r.PostFormValue("webhook-url"))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 
 		tx, err := rwDB.Begin()
 		if err != nil {
-			log.Printf("postCreateNotification.BeginSlack: %s", err)
+			log.Printf("postCreateNotificationChannel.BeginSlack: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13384,7 +14031,7 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 
 		channels, err := listNotificationChannels(tx, listNotificationsOptions{})
 		if err != nil {
-			log.Printf("postCreateNotification.listNotificationChannelsSlack: %s", err)
+			log.Printf("postCreateNotificationChannel.listNotificationChannelsSlack: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13402,13 +14049,68 @@ func postCreateNotification(w http.ResponseWriter, r *http.Request) {
 			string(serializedDetails),
 		)
 		if err != nil {
-			log.Printf("postCreateNotification.createNotificationSlack: %s", err)
+			log.Printf("postCreateNotificationChannel.createNotificationSlack: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		if err = tx.Commit(); err != nil {
-			log.Printf("postCreateNotification.CommitSlack: %s", err)
+			log.Printf("postCreateNotificationChannel.CommitSlack: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	} else if notificationType == "discord" {
+		webhookURL, err := url.ParseRequestURI(r.PostFormValue("webhook-url"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		tx, err := rwDB.Begin()
+		if err != nil {
+			log.Printf("postCreateNotificationChannel.BeginDiscord: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
+		details := DiscordNotificationDetails{
+			WebhookURL: webhookURL.String(),
+		}
+
+		serializedDetails, err := json.Marshal(details)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		channels, err := listNotificationChannels(tx, listNotificationsOptions{})
+		if err != nil {
+			log.Printf("postCreateNotificationChannel.listNotificationChannelsDiscord: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		channelSlugs := map[string]bool{}
+		for _, v := range channels {
+			channelSlugs[v.Slug] = true
+		}
+
+		err = createNotification(
+			tx,
+			generateSlug(displayName, channelSlugs),
+			displayName,
+			notificationType,
+			string(serializedDetails),
+		)
+		if err != nil {
+			log.Printf("postCreateNotificationChannel.createNotificationDiscord: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if err = tx.Commit(); err != nil {
+			log.Printf("postCreateNotificationChannel.CommitDiscord: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -13455,6 +14157,15 @@ func getNotificationChannelByID(tx *sql.Tx, id int) (NotificationChannel, error)
 		}
 
 		channel.Details = details
+	} else if channel.Type == "discord" {
+		var details DiscordNotificationDetails
+
+		err := json.Unmarshal([]byte(detailsStr), &details)
+		if err != nil {
+			return channel, fmt.Errorf("getNotificationChannelByID.UnmarshalDiscord: %w", err)
+		}
+
+		channel.Details = details
 	}
 
 	return channel, nil
@@ -13495,6 +14206,15 @@ func getNotificationChannelBySlug(tx *sql.Tx, slug string) (NotificationChannel,
 		err := json.Unmarshal([]byte(detailsStr), &details)
 		if err != nil {
 			return channel, fmt.Errorf("getNotificationChannelBySlug.UnmarshalSlack: %w", err)
+		}
+
+		channel.Details = details
+	} else if channel.Type == "discord" {
+		var details DiscordNotificationDetails
+
+		err := json.Unmarshal([]byte(detailsStr), &details)
+		if err != nil {
+			return channel, fmt.Errorf("getNotificationChannelBySlug.UnmarshalDiscord: %w", err)
 		}
 
 		channel.Details = details
@@ -13599,6 +14319,15 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 								</span>
 							</label>
 						{{end}}
+						{{if eq .Notification.Type "discord"}}
+							<label>
+								<input type="radio" name="type" value="slack" required checked />
+								<span>
+									<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" preserveAspectRatio="xMidYMid" viewBox="0 -28.5 256 256"><path fill="#5865F2" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"></path></svg>
+									Discord
+								</span>
+							</label>
+						{{end}}
 					</div>
 
 					<label>
@@ -13607,7 +14336,7 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 					</label>
 					
 					{{if eq .Notification.Type "smtp"}}
-						<fieldset class="smtp-container smtp-container--visible">
+						<fieldset class="smtp-container visible">
 							<label>
 								Host
 								<input 
@@ -13733,7 +14462,7 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 							</div>
 						</fieldset>
 					{{else if eq .Notification.Type "slack"}}
-						<fieldset class="slack-container slack-container--visible">
+						<fieldset class="slack-container visible">
 							<legend class="hide">Slack info</legend>
 							<label>
 								Webhook URL
@@ -13743,20 +14472,16 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 									value="{{.Notification.Details.WebhookURL}}"
 									required
 								/>
+							</label>
 
-								<button 
-									type="button"
-									class="help"
-									onclick="document.querySelector('.slack-tutorial').classList.toggle('slack-tutorial--visible');"
-								>
+							<details class="tutorial">
+								<summary class="help">
 									How do I get a webhook URL?
 									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
 										<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
 									</svg>
-								</button>
-							</label>
+								</summary>
 
-							<div class="slack-tutorial">
 								<p>You'll need to create a Slack app (if you haven't already) and then add a new webhook to your workspace.</p>
 
 								<a href="https://api.slack.com/apps/new" target="_blank">
@@ -13808,7 +14533,36 @@ func getEditNotification(w http.ResponseWriter, r *http.Request) {
 									src="/static/images/slack-notification-tutorial/5.png"
 									style="width: 100%;"
 								/>
-							</div>
+							</details>
+						</fieldset>
+					{{else if eq .Notification.Type "discord"}}
+						<fieldset class="discord-container visible">
+							<legend class="hide">Discord info</legend>
+							<label>
+								Webhook URL
+								<input 
+									name="webhook-url"
+									type="url"
+									value="{{.Notification.Details.WebhookURL}}"
+									required
+								/>
+							</label>
+
+							<details class="tutorial">
+								<summary class="help">
+									How do I get a webhook URL?
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+										<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+									</svg>
+								</summary>
+								<p>Open your Server Settings and head into the Integrations tab</p>
+								<p>Click the "Create Webhook" button to create a new webhook!</p>
+							
+								<img 
+									src="/static/images/discord-webhook-tutorial/1.png"
+									style="width: 100%;"
+								>
+							</details>
 						</fieldset>
 					{{end}}
 
@@ -14082,6 +14836,7 @@ func postEditNotification(w http.ResponseWriter, r *http.Request) {
 		webhookURL, err := url.ParseRequestURI(r.PostFormValue("webhook-url"))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 
 		details := SlackNotificationDetails{
@@ -14106,6 +14861,38 @@ func postEditNotification(w http.ResponseWriter, r *http.Request) {
 		)
 		if err != nil {
 			log.Printf("postEditNotification.editNotificationChannelSlack: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	} else if channel.Type == "discord" {
+		webhookURL, err := url.ParseRequestURI(r.PostFormValue("webhook-url"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		details := DiscordNotificationDetails{
+			WebhookURL: webhookURL.String(),
+		}
+
+		serializedDetails, err := json.Marshal(details)
+		if err != nil {
+			log.Printf("postEditNotification.MarshalDiscord %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = editNotificationChannel(
+			tx,
+			NotificationChannel{
+				ID:      channel.ID,
+				Name:    displayName,
+				Type:    channel.Type,
+				Details: serializedDetails,
+			},
+		)
+		if err != nil {
+			log.Printf("postEditNotification.editNotificationChannelDiscord: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -17203,18 +17990,14 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 
 							</a>
 
-							<button 
-								type="button"
-								class="help"
-								onclick="document.querySelector('.slack-tutorial').classList.toggle('slack-tutorial--visible');"
-							>
-								How do I create a personal access token?
-								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-								</svg>
-							</button>
+							<details class="tutorial">
+								<summary class="help">
+									How do I create a personal access token?
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+									</svg>
+								</summary>
 
-							<div class="slack-tutorial">
 								<a href="https://github.com/settings/personal-access-tokens/new" target="_blank">
 									<svg viewBox="0 0 98 96" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z" fill="#171515"/></svg>
 									Create PAT
@@ -17244,20 +18027,16 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 								/>
 
 								<p>Finally, select "Generate token"</p>
-							</div>
+							</details>
 
-							<button 
-								type="button"
-								class="help"
-								onclick="document.querySelector('.slack-tutorial-app').classList.toggle('slack-tutorial-app--visible');"
-							>
-								How do I create a repository webhook?
-								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
-									<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-								</svg>
-							</button>
+							<details class="tutorial">
+								<summary class="help">
+									How do I create a repository webhook?
+									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+										<path fill-rule="evenodd" d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+									</svg>
+								</summary>
 
-							<div class="slack-tutorial-app">
 								<p>On your GitHub repository navigate to Settings > Webhooks</p>
 								
 								<p>Select "Add webhook"</p>
@@ -17270,7 +18049,7 @@ func getConfigSettings(w http.ResponseWriter, r *http.Request) {
 									src="/static/images/github-webhook-tutorial/1.png"
 									style="width: 100%;"
 								/>
-							</div>
+							</details>
 						</div>
 					</fieldset>
 					

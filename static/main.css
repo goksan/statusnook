@@ -2484,7 +2484,7 @@ label {
     border: none;
 }
 
-.smtp-container--visible {
+.smtp-container.visible {
     display: flex;
 }
 
@@ -2511,20 +2511,31 @@ label {
     border: none
 }
 
-.slack-container--visible {
+.slack-container.visible {
     display: block;
 }
 
-.slack-container img {
+.slack-container img, .discord-container img {
     border-radius: 1.0rem;
     border: 1px solid #E6E6E6;
     margin-bottom: 2.0rem;
 }
 
-.slack-container p {
+.slack-container p, .discord-container p {
     margin-top: 0;
     font-size: 1.4rem;
     color: #606060;
+}
+
+.discord-container {
+    display: none;
+    margin: 0;
+    padding: 0;
+    border: none
+}
+
+.discord-container.visible {
+    display: block;
 }
 
 .help {
@@ -2544,21 +2555,25 @@ label {
     margin-left: 0.4rem;
 }
 
-.slack-tutorial, .slack-tutorial-app {
-    display: none;
+.tutorial {
     margin-top: 0.8rem;
+}
+
+.tutorial summary {
+    list-style: none;
+    user-select: none;
+    cursor: pointer;
+}
+
+.tutorial[open] {
     margin-bottom: 3.6rem;
 }
 
-.slack-tutorial :last-child {
+.tutorial > :last-child {
     margin: 0;
 }
 
-.slack-tutorial--visible, .slack-tutorial-app--visible {
-    display: block;
-}
-
-.slack-tutorial a, .slack-tutorial-app a {
+.tutorial a {
     display: inline-flex;
     align-items: center;
     border-radius: 0.4rem;
@@ -2572,12 +2587,13 @@ label {
     box-shadow: 0px 1px 2px 0px rgba(0, 0, 0, 0.05);
 }
 
-.slack-tutorial a svg:nth-of-type(1) {
+.tutorial a svg:nth-of-type(1) {
     width: 2rem;
+    height: auto;
     margin-right: 0.8rem;
 }
 
-.slack-tutorial a svg:nth-of-type(2) {
+.tutorial a svg:nth-of-type(2) {
     width: 1.4rem;
     margin-left: 0.4rem;
 }
