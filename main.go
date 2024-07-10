@@ -1375,8 +1375,6 @@ func sendMonitorAlertDiscord(
 	}
 
 	const downMarkup = `
-		{{- ":rotating_light:"}} {{.MonitorName}} started failing{{"\n\n"}}
-
 		{{- if .StatusCode}}
 			{{- "Status code"}}: {{.StatusCode}}{{"\n"}}
 		{{else}}
@@ -1387,14 +1385,17 @@ func sendMonitorAlertDiscord(
 	`
 
 	const upMarkup = `
-		{{- ":white_check_mark:"}} {{.MonitorName}} started succeeding{{"\n\n"}}
-
 		{{- "Checked at"}}: {{.CheckedAt}}{{"\n\n"}}
 		{{- "https://"}}{{.Domain}}/admin/monitors/{{.MonitorID}}
 	`
 
+	title := ":rotating_light: " + monitor.Name + " started failing"
+	colour := 15947846
+
 	markup := downMarkup
 	if status == "up" {
+		title = ":white_check_mark: " + monitor.Name + " started succeeding"
+		colour = 1758331
 		markup = upMarkup
 	}
 
@@ -1403,10 +1404,10 @@ func sendMonitorAlertDiscord(
 		return fmt.Errorf("sendMonitorAlertDiscord.parseEmailTmpls: %w", err)
 	}
 
-	emailStr := bytes.Buffer{}
+	notificationContent := bytes.Buffer{}
 
 	err = tmpl.Execute(
-		&emailStr,
+		&notificationContent,
 		struct {
 			MonitorID   int
 			MonitorName string
@@ -1427,12 +1428,25 @@ func sendMonitorAlertDiscord(
 		return fmt.Errorf("sendMonitorAlertDiscord.Execute: %w", err)
 	}
 
+	type Embed struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Color       int    `json:"color"`
+	}
+
 	type DiscordWebhookRequestBody struct {
-		Content string `json:"content"`
+		Content string  `json:"content"`
+		Embeds  []Embed `json:"embeds"`
 	}
 
 	body := DiscordWebhookRequestBody{
-		Content: emailStr.String(),
+		Embeds: []Embed{
+			{
+				Title:       title,
+				Description: notificationContent.String(),
+				Color:       colour,
+			},
+		},
 	}
 
 	serializedBody, err := json.Marshal(body)
@@ -1455,7 +1469,7 @@ func sendMonitorAlertDiscord(
 		return fmt.Errorf("sendMonitorAlertDiscord.ReadAll: %w", err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
 		return fmt.Errorf("sendMonitorAlertDiscord.StatusCode: %s", string(data))
 	}
 
