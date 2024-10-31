@@ -5494,6 +5494,25 @@ func index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	monitors, err := listMonitors(tx)
+	if err != nil {
+		log.Printf("index.listMonitors: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	lastCheckedLogs, err := listAllMonitorLogLastChecked(tx)
+	if err != nil {
+		log.Printf("monitors.listAllMonitorLogLastChecked: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	monitorHappy := make(map[int]bool, len(lastCheckedLogs))
+	for _, v := range lastCheckedLogs {
+		monitorHappy[v.ID] = v.ResponseCode.Int32 != 0 && v.ResponseCode.Int32 < 400
+	}
+
 	alerts, err := getOngoingAlerts(tx)
 	if err != nil {
 		log.Printf("index.getOngoingAlerts: %s", err)
@@ -5534,24 +5553,20 @@ func index(w http.ResponseWriter, r *http.Request) {
 		{{define "body"}}
 			<div class="index-container">
 				<div class="services-list">
-					{{range $service := .Services}}
+					{{range $monitor := .Monitors}}
 						<div class="service-row">
 							<div>
-								<span>{{$service.Name}}</span>
-								<span>{{$service.HelperText}}</span>
+								<span>{{$monitor.Name}}</span>
+								<span>{{$monitor.URL}}</span>
 							</div>
 							<div>
-								{{if eq (index $.ServiceStatuses $service.ID) "red"}}
-									<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#F84B37">
-										<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-									</svg>
-								{{else if eq (index $.ServiceStatuses $service.ID) "amber"}}
-									<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#E5B773" class="w-6 h-6">
-  										<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-									</svg>
-								{{else}}
+								{{if index $.MonitorHappy $monitor.ID}}
 									<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
 										<path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd" />
+									</svg>
+								{{else}}
+									<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#F84B37">
+										<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
 									</svg>
 								{{end}}
 							</div>
@@ -5764,6 +5779,8 @@ func index(w http.ResponseWriter, r *http.Request) {
 		w,
 		struct {
 			Services             []service
+			Monitors             []Monitor
+			MonitorHappy         map[int]bool
 			IncidentAlerts       []FormattedAlertDetail
 			ServiceStatuses      map[int]string
 			HasEmailAlertChannel bool
@@ -5771,6 +5788,8 @@ func index(w http.ResponseWriter, r *http.Request) {
 			Ctx                  pageCtx
 		}{
 			Services:             services,
+			Monitors:             monitors,
+			MonitorHappy:         monitorHappy,
 			IncidentAlerts:       formattedAlerts,
 			ServiceStatuses:      serviceStatuses,
 			HasEmailAlertChannel: hasEmailAlertChannel,
